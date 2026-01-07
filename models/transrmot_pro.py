@@ -700,7 +700,25 @@ class TransRMOT(nn.Module):
         static_map = static_map.unsqueeze(0).to(src.device)
 
         # Extract linguistic features
+        # static_feat: (Num_Static_Tokens, Hidden_Dim) -> e.g., (2, 256)
+        # motion_feat: (Num_Motion_Tokens, Hidden_Dim)
         text_sentence_features, text_word_mask, text_word_features,  motion_map, subject_map, static_map, motion_feat, static_feat, subject_feat = self.forward_text(sentences, motion_map, subject_map, static_map, src.device)
+
+        # === 1. 新增：计算 SGDP 所需的原型向量 (Prototypes) ===
+        # 将 token 序列聚合为单个向量，用于空间门控和通道门控
+        if static_feat.size(0) > 0:
+            static_prototype = static_feat.mean(dim=0).view(1, 1, -1) # [1, 1, C]
+        else:
+            # Fallback: 如果没有静态词，使用整句特征的均值
+            static_prototype = text_sentence_features.mean(dim=1).view(1, 1, -1)
+
+        if motion_feat.size(0) > 0:
+            motion_prototype = motion_feat.mean(dim=0).view(1, 1, -1) # [1, 1, C]
+        else:
+            # Fallback: 全0向量，避免影响融合
+            motion_prototype = torch.zeros_like(static_prototype)
+        # =======================================================
+
         text_sentence_features = text_sentence_features.flatten(0, 1).unsqueeze(0)
         text_word_mask = text_word_mask.flatten(0, 1).unsqueeze(0)
         text_pos = self.text_pos(NestedTensor(text_word_features, text_word_mask)).permute(2, 0, 1)
@@ -708,6 +726,9 @@ class TransRMOT(nn.Module):
         static_mask = torch.zeros((1, static_feat.size(0)), dtype=torch.bool).to(src.device) 
         # subject_feat_pos = self.text_pos(NestedTensor(subject_feat, subject_mask)).permute(2, 0, 1)
         static_feat_pos = self.text_pos(NestedTensor(static_feat, static_mask)).permute(2, 0, 1)
+        
+        # 保持原逻辑：为 Fusion Module 准备序列形式的特征
+        # static_feat: (Seq, Dim) -> (Seq, 1, Dim)
         static_feat = static_feat.unsqueeze(0).permute(1, 0, 2)
         subject_feat = subject_feat.unsqueeze(0).permute(1, 0, 2)
 
@@ -719,7 +740,7 @@ class TransRMOT(nn.Module):
             "static_map": static_map,
             "text_word_features": text_sentence_features,
             "motion_feat": motion_feat,
-            "static_feat": static_feat,
+            "static_feat": static_feat, # 注意：这里依然是序列形式，供 Fusion Module 使用
             "subject_feat": subject_feat,
             "static_feat_pos":static_feat_pos,
             "static_mask":static_mask
@@ -772,8 +793,15 @@ class TransRMOT(nn.Module):
                 masks.append(mask)
                 pos.append(pos_l)
 
+        # === 2. 修改 Transformer 调用，传入 Prototypes ===
         hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
-            self.transformer(srcs, masks, pos, track_instances.query_pos, text_sentence_features, text_dict, ref_pts=track_instances.ref_pts)
+            self.transformer(srcs, masks, pos, track_instances.query_pos, 
+                             text_sentence_features, text_dict, 
+                             ref_pts=track_instances.ref_pts,
+                             static_feat=static_prototype,   # <--- 新增
+                             motion_feat=motion_prototype)   # <--- 新增
+        # ===============================================
+
         outputs_classes = []
         outputs_coords = []
         outputs_refers = []
@@ -816,7 +844,6 @@ class TransRMOT(nn.Module):
         out['text_pos'] = text_pos 
         out['text_word_features'] = text_word_features 
         return out
-
 
     def _post_process_single_image(self, frame_res, track_instances, is_last):
         frame_res['track_instances'] = track_instances

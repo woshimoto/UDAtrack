@@ -132,7 +132,7 @@ class DeformableTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, srcs, masks, pos_embeds, query_embed=None, ref_pts=None, valid_ratio=None):
+    def forward(self, srcs, masks, pos_embeds, query_embed=None, ref_pts=None, valid_ratio=None,static_feat=None, motion_feat=None):
         assert self.two_stage or query_embed is not None
 
         # prepare input for encoder
@@ -190,13 +190,13 @@ class DeformableTransformer(nn.Module):
                 reference_points = ref_pts.unsqueeze(0).repeat(bs, 1, 1).sigmoid()
             init_reference_out = reference_points
         # decoder
-        hs, inter_references = self.decoder(tgt, reference_points, memory,
-                                            spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten)
+        hs, inter_references, spatial_scores = self.decoder(tgt, reference_points, memory,
+                                            spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten,static_feat=static_feat, motion_feat=motion_feat)
 
         inter_references_out = inter_references
         if self.two_stage:
-            return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact
-        return hs, init_reference_out, inter_references_out, None, None
+            return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact, spatial_scores
+        return hs, init_reference_out, inter_references_out, None, None, spatial_scores
 
 
 class DeformableTransformerEncoderLayer(nn.Module):
@@ -297,7 +297,24 @@ class DeformableTransformerDecoderLayer(nn.Module):
         self.linear2 = nn.Linear(d_ffn, d_model)
         self.dropout4 = nn.Dropout(dropout)
         self.norm3 = nn.LayerNorm(d_model)
-
+        #1.static-Guided Spatial Gate 
+        self.spatial_gate = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),
+            nn.ReLU(),
+            nn.Linear(d_model // 4, 1),
+            nn.Sigmoid()
+        )
+        #2.Uncertainty-Guided Spatial Gate 
+        self.channel_gate = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Linear(d_model // 2, d_model),
+            nn.Sigmoid()
+        )
+        # 融合系数 (可学习)
+        self.beta = nn.Parameter(torch.tensor(0.0))
+        # ===========================
+        
     @staticmethod
     def with_pos_embed(tensor, pos):
         return tensor if pos is None else tensor + pos
@@ -319,44 +336,92 @@ class DeformableTransformerDecoderLayer(nn.Module):
         return self.norm2(tgt)
 
     def _forward_self_cross(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index,
-                            src_padding_mask=None, attn_mask=None):
+                            src_padding_mask=None, attn_mask=None,static_feat=None, motion_feat=None):
 
         # self attention
         tgt = self._forward_self_attn(tgt, query_pos, attn_mask)
+        if static_feat is not None:
+            # 语义交互: 视觉特征 src 与 静态原型 static_feat 进行 Hadamard 积
+            # 广播机制: [Batch, Sum_HW, C] * [Batch, 1, C] -> [Batch, Sum_HW, C]
+            semantic_response = src * static_feat 
+            
+            # 计算空间重要性分数
+            spatial_score = self.spatial_gate(semantic_response) # [Batch, Sum_HW, 1]
+            
+            # 执行软剪枝: 抑制不符合静态描述的背景
+            src_pruned = src * spatial_score
+        else:
+            src_pruned = src
+            spatial_score = None
         # cross attention
+        #此处传入的是src_pruned
         tgt2 = self.cross_attn(self.with_pos_embed(tgt, query_pos),
                                reference_points,
-                               src, src_spatial_shapes, level_start_index, src_padding_mask)
-        tgt = tgt + self.dropout1(tgt2)
+                               src_pruned, src_spatial_shapes, level_start_index, src_padding_mask)
+        # === 创新点 2: 不确定性引导的通道剪枝 (Uncertainty-Guided Channel Pruning) ===
+        if static_feat is not None and motion_feat is not None:
+            # 计算通道不确定性 alpha [Batch, Num_Queries, C]
+            alpha = self.channel_gate(tgt2) 
+            
+            # 动态融合: 使用静态特征补全外观，使用运动特征补全轨迹
+            lang_refined = alpha * static_feat + (1 - alpha) * motion_feat
+            
+            # 注入修正 (Residual Connection + Dropout)
+            tgt = tgt + self.dropout1(tgt2) + self.beta * lang_refined
+        else:
+            tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
 
         # ffn
         tgt = self.forward_ffn(tgt)
 
-        return tgt
+        return tgt, spatial_score
 
     def _forward_cross_self(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index,
-                            src_padding_mask=None, attn_mask=None):
+                            src_padding_mask=None, attn_mask=None,static_feat=None, motion_feat=None):
         # cross attention
+        if static_feat is not None:
+            # 语义交互: 视觉特征 src 与 静态原型 static_feat 进行 Hadamard 积
+            # 广播机制: [Batch, Sum_HW, C] * [Batch, 1, C] -> [Batch, Sum_HW, C]
+            semantic_response = src * static_feat 
+            
+            # 计算空间重要性分数
+            spatial_score = self.spatial_gate(semantic_response) # [Batch, Sum_HW, 1]
+            
+            # 执行软剪枝: 抑制不符合静态描述的背景
+            src_pruned = src * spatial_score
+        else:
+            src_pruned = src
+            spatial_score = None
         tgt2 = self.cross_attn(self.with_pos_embed(tgt, query_pos),
                                reference_points,
-                               src, src_spatial_shapes, level_start_index, src_padding_mask)
-        tgt = tgt + self.dropout1(tgt2)
+                               src_pruned, src_spatial_shapes, level_start_index, src_padding_mask)
+        if static_feat is not None and motion_feat is not None:
+            # 计算通道不确定性 alpha [Batch, Num_Queries, C]
+            alpha = self.channel_gate(tgt2) 
+            
+            # 动态融合: 使用静态特征补全外观，使用运动特征补全轨迹
+            lang_refined = alpha * static_feat + (1 - alpha) * motion_feat
+            
+            # 注入修正 (Residual Connection + Dropout)
+            tgt = tgt + self.dropout1(tgt2) + self.beta * lang_refined
+        else:
+            tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
         # self attention
         tgt = self._forward_self_attn(tgt, query_pos, attn_mask)
         # ffn
         tgt = self.forward_ffn(tgt)
 
-        return tgt
+        return tgt, spatial_score
 
-    def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index, src_padding_mask=None):
+    def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index, src_padding_mask=None,static_feat=None, motion_feat=None):
         attn_mask = None
         if self.self_cross:
             return self._forward_self_cross(tgt, query_pos, reference_points, src, src_spatial_shapes,
-                                            level_start_index, src_padding_mask, attn_mask)
+                                            level_start_index, src_padding_mask, attn_mask,static_feat, motion_feat)
         return self._forward_cross_self(tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index,
-                                        src_padding_mask, attn_mask)
+                                        src_padding_mask, attn_mask,static_feat, motion_feat)
 
 
 class DeformableTransformerDecoder(nn.Module):
@@ -370,11 +435,12 @@ class DeformableTransformerDecoder(nn.Module):
         self.class_embed = None
 
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,
-                query_pos=None, src_padding_mask=None):
+                query_pos=None, src_padding_mask=None,static_feat=None, motion_feat=None):
         output = tgt
 
         intermediate = []
         intermediate_reference_points = []
+        all_spatial_scores = []
         for lid, layer in enumerate(self.layers):
             if reference_points.shape[-1] == 4:
                 reference_points_input = reference_points[:, :, None] \
@@ -383,8 +449,8 @@ class DeformableTransformerDecoder(nn.Module):
                 assert reference_points.shape[-1] == 2
                 reference_points_input = reference_points[:, :, None] * src_valid_ratios[:, None]
             # two random variables, tgt and query_pos. tgt represents query, and query_pos represents position and generates reference points
-            output = layer(output, query_pos, reference_points_input, src, src_spatial_shapes, src_level_start_index, src_padding_mask)
-
+            output, spatial_score = layer(output, query_pos, reference_points_input, src, src_spatial_shapes, src_level_start_index, src_padding_mask,static_feat=static_feat, motion_feat=motion_feat)
+            all_spatial_scores.append(spatial_score)
             # hack implementation for iterative bounding box refinement
             if self.bbox_embed is not None:
                 tmp = self.bbox_embed[lid](output)
@@ -397,15 +463,16 @@ class DeformableTransformerDecoder(nn.Module):
                     new_reference_points[..., :2] = tmp[..., :2] + inverse_sigmoid(reference_points)
                     new_reference_points = new_reference_points.sigmoid()
                 reference_points = new_reference_points.detach()
+                pass
 
             if self.return_intermediate:
                 intermediate.append(output)
                 intermediate_reference_points.append(reference_points)
 
         if self.return_intermediate:
-            return torch.stack(intermediate), torch.stack(intermediate_reference_points)
+            return torch.stack(intermediate), torch.stack(intermediate_reference_points), all_spatial_scores
 
-        return output, reference_points
+        return output, reference_points, all_spatial_scores
 
 
 def _get_clones(module, N):

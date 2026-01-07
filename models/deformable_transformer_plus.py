@@ -148,7 +148,8 @@ class DeformableTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, srcs, masks, pos_embeds, query_embed=None, sentence_embeds=None, text_dict=None, ref_pts=None):
+    def forward(self, srcs, masks, pos_embeds, query_embed=None, sentence_embeds=None, text_dict=None, ref_pts=None,
+                static_feat=None, motion_feat=None):
         assert self.two_stage or query_embed is not None
 
         # prepare input for encoder
@@ -210,7 +211,8 @@ class DeformableTransformer(nn.Module):
 
         # decoder
         hs, inter_references = self.decoder(tgt, reference_points, memory, spatial_shapes, level_start_index,
-                                            valid_ratios, query_embed, mask_flatten, lvl_pos_embed_flatten, sentence_embeds, text_dict)
+                                            valid_ratios, query_embed, mask_flatten, lvl_pos_embed_flatten, sentence_embeds, text_dict,
+                                            static_feat=static_feat, motion_feat=motion_feat)
 
         inter_references_out = inter_references
         if self.two_stage:
@@ -328,6 +330,21 @@ class DeformableTransformerDecoderLayer(nn.Module):
         else:
             print('Training with Cross-Self Attention.')
 
+        # === SGDP Modules ===
+        self.spatial_gate = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),
+            nn.ReLU(),
+            nn.Linear(d_model // 4, 1),
+            nn.Sigmoid()
+        )
+        self.channel_gate = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Linear(d_model // 2, d_model),
+            nn.Sigmoid()
+        )
+        self.beta = nn.Parameter(torch.tensor(0.0))
+        # ====================
 
     @staticmethod
     def with_pos_embed(tensor, pos):
@@ -363,7 +380,16 @@ class DeformableTransformerDecoderLayer(nn.Module):
         return tgt
 
     def _forward_self_cross(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index,
-                            src_padding_mask=None, attn_mask=None, lvl_pos_embed_flatten=None):
+                            src_padding_mask=None, attn_mask=None, lvl_pos_embed_flatten=None,
+                            static_feat=None, motion_feat=None):
+        
+        # === SGDP Spatial Pruning ===
+        if static_feat is not None:
+             # src is [Batch, Len, C] here before transpose
+             semantic_response = src * static_feat
+             spatial_score = self.spatial_gate(semantic_response)
+             src = src * spatial_score
+
         # self attention
         src = src.transpose(0, 1)
         tgt = self._forward_self_attn(tgt, query_pos, attn_mask)
@@ -371,7 +397,15 @@ class DeformableTransformerDecoderLayer(nn.Module):
         tgt2 = self.cross_attn(self.with_pos_embed(tgt, query_pos),
                                reference_points,
                                src, src_spatial_shapes, level_start_index, src_padding_mask)
-        tgt = tgt + self.dropout1(tgt2)
+
+        # === SGDP Channel Pruning ===
+        if static_feat is not None and motion_feat is not None:
+            alpha = self.channel_gate(tgt2)
+            lang_refined = alpha * static_feat + (1 - alpha) * motion_feat
+            tgt = tgt + self.dropout1(tgt2) + self.beta * lang_refined
+        else:
+            tgt = tgt + self.dropout1(tgt2)
+
         tgt = self.norm1(tgt)
 
         # ffn
@@ -380,12 +414,28 @@ class DeformableTransformerDecoderLayer(nn.Module):
         return tgt
 
     def _forward_cross_self(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index,
-                            src_padding_mask=None, attn_mask=None, lvl_pos_embed_flatten=None):
+                            src_padding_mask=None, attn_mask=None, lvl_pos_embed_flatten=None,
+                            static_feat=None, motion_feat=None):
+        
+        # === SGDP Spatial Pruning ===
+        if static_feat is not None:
+             semantic_response = src * static_feat
+             spatial_score = self.spatial_gate(semantic_response)
+             src = src * spatial_score
+
         # cross attention
         tgt2 = self.cross_attn(self.with_pos_embed(tgt, query_pos),
                                reference_points,
                                src, src_spatial_shapes, level_start_index, src_padding_mask)
-        tgt = tgt + self.dropout1(tgt2)
+
+        # === SGDP Channel Pruning ===
+        if static_feat is not None and motion_feat is not None:
+            alpha = self.channel_gate(tgt2)
+            lang_refined = alpha * static_feat + (1 - alpha) * motion_feat
+            tgt = tgt + self.dropout1(tgt2) + self.beta * lang_refined
+        else:
+            tgt = tgt + self.dropout1(tgt2)
+
         tgt = self.norm1(tgt)
         # self attention
         tgt = self._forward_self_attn(tgt, query_pos, attn_mask)
@@ -395,13 +445,16 @@ class DeformableTransformerDecoderLayer(nn.Module):
         return tgt
 
     def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index,
-                src_padding_mask=None, lvl_pos_embed_flatten=None):
+                src_padding_mask=None, lvl_pos_embed_flatten=None,
+                static_feat=None, motion_feat=None):
         attn_mask = None
         if self.self_cross:# True
             return self._forward_self_cross(tgt, query_pos, reference_points, src, src_spatial_shapes,
-                                            level_start_index, src_padding_mask, attn_mask, lvl_pos_embed_flatten)
+                                            level_start_index, src_padding_mask, attn_mask, lvl_pos_embed_flatten,
+                                            static_feat, motion_feat)
         return self._forward_cross_self(tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index,
-                                        src_padding_mask, attn_mask, lvl_pos_embed_flatten)
+                                        src_padding_mask, attn_mask, lvl_pos_embed_flatten,
+                                        static_feat, motion_feat)
 
 
 class DeformableTransformerDecoder(nn.Module):
@@ -452,7 +505,8 @@ class DeformableTransformerDecoder(nn.Module):
             )
         
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,
-                query_pos=None, src_padding_mask=None, lvl_pos_embed_flatten=None, sentence_embeds=None, text_dict=None):
+                query_pos=None, src_padding_mask=None, lvl_pos_embed_flatten=None, sentence_embeds=None, text_dict=None,
+                static_feat=None, motion_feat=None):
         b, n, c = tgt.shape
         # output = repeat(sentence_embeds, 'b c -> b n c', n=n) + tgt # rmot_4a
         sentence_embeds = repeat(sentence_embeds, 'b c -> b n c', n=n).transpose(1,0) # rmot_4
@@ -478,7 +532,8 @@ class DeformableTransformerDecoder(nn.Module):
                                     )
             
             output = layer(output, query_pos, reference_points_input, src_level, src_spatial_shapes, src_level_start_index,
-                           src_padding_mask, lvl_pos_embed_flatten)
+                           src_padding_mask, lvl_pos_embed_flatten,
+                           static_feat=static_feat, motion_feat=motion_feat)
             
             output = self.cross_test[lid]( 
                 output,
@@ -823,5 +878,3 @@ def build_deforamble_transformer(args):
         sigmoid_attn=args.sigmoid_attn,
         extra_track_attn=args.extra_track_attn,
     )
-
-
