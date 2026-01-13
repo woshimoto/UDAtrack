@@ -328,8 +328,8 @@ class Detector(object):
         self.checkpoint_id = checkpoint_id
 
         self.seq_num = seq_num
-        img_list = os.listdir(os.path.join(self.args.rmot_path, '/share2/share/dataset/ref-kitti/KITTI/training/image_02/', self.seq_num[0]))
-        img_list = [os.path.join(self.args.rmot_path, '/share2/share/dataset/ref-kitti/KITTI/training/image_02/', self.seq_num[0], _)
+        img_list = os.listdir(os.path.join(self.args.rmot_path, '/root/autodl-tmp/Ref-KITTI/KITTI/training/image_02/', self.seq_num[0]))
+        img_list = [os.path.join(self.args.rmot_path, '/root/autodl-tmp/Ref-KITTI/KITTI/training/image_02/', self.seq_num[0], _)
                     for _ in img_list if ('jpg' in _) or ('png' in _)]
 
         self.img_list = sorted(img_list)
@@ -504,7 +504,7 @@ if __name__ == '__main__':
     if "refer-kitti-v2" in args0.rmot_path:
         video_ids = ['0005', '0011', '0013','0019']
     else:
-        video_ids = ['0013']
+        video_ids = ['0011', '0013']
 
     seq_nums = [] 
     for video_id in video_ids:  

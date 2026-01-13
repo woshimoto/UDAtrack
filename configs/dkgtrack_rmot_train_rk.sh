@@ -4,11 +4,11 @@ OUT='/root/autodl-tmp/dkg_rmot/DKGTrack-main/exps/saved_models_rk/motion_4'
 TRAIN_LOG_FILE=/root/autodl-tmp/dkg_rmot/DKGTrack-main/exps/saved_models_rk/motion_4/train_log.txt
 PID_FILE=/root/autodl-tmp/dkg_rmot/DKGTrack-main/exps/saved_models_rk/motion_4/train_pid.txt
 
-python3 main.py \
+python3 -m torch.distributed.run --nproc_per_node=8 --master_port 23333 main.py  \
    --meta_arch temp_rmot \
    --use_checkpoint \
    --dataset_file e2e_rmot \
-   --epoch 20 \
+   --epoch 100 \
    --with_box_refine \
    --lr_drop 40 \
    --lr 1e-4 \
@@ -22,16 +22,16 @@ python3 main.py \
    --sampler_steps 60 80 90 \
    --sampler_lengths 4 4 4 4 \
    --update_query_pos \
-   --merger_dropout 0 \
+   --merger_dropout 0.1 \
    --dropout 0 \
-   --random_drop 0.1 \
+   --random_drop 0 \
    --fp_ratio 0.3 \
    --query_interaction_layer QIM \
    --data_txt_path_train /root/autodl-tmp/dkg_rmot/DKGTrack-main/datasets/data_path/refer-kitti/refer-kitti.train \
    --rmot_path /root/autodl-tmp/Ref-KITTI \
    --hist_len 4 \
    --refer_loss_coef 2 \
-   #--resume /home/linzhongxu/code/kdgtrack/DKGTrack-main/exps/saved_models_rk/motion_4/checkpoint0099.pth \
+   --resume /root/autodl-tmp/dkg_rmot/DKGTrack-main/exps/saved_models_rk/motion_4/checkpoint0054.pth \
 
    # >"$TRAIN_LOG_FILE" & echo $! >"$PID_FILE"
 

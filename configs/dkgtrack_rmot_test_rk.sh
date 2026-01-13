@@ -26,9 +26,9 @@ python3 inference.py \
 --visualization  \
 --query_interaction_layer QIM \
 --extra_track_attn \
---resume /home/linzhongxu/code/kdgtrack/DKGTrack-main/exps/saved_models_rk/motion_4/checkpoint0099.pth \
---rmot_path /share2/share/dataset/ref-kitti/ \
+--resume /root/autodl-tmp/dkg_rmot/DKGTrack-main/exps/saved_models_rk/motion_4/checkpoint0089.pth \
+--rmot_path /root/autodl-tmp/Ref-KITTI \
 --hist_len 8 \
---output_dir /home/linzhongxu/code/kdgtrack/DKGTrack-main/exps/saved_models_rk/motion
+--output_dir /root/autodl-tmp/dkg_rmot/DKGTrack-main/exps/saved_models_rk/motion
 #--visualization
 #
