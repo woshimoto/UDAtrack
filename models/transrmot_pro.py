@@ -52,7 +52,10 @@ class ClipMatcher(SetCriterion):
     def __init__(self, num_classes,
                         matcher,
                         weight_dict,
-                        losses):
+                        losses,
+                        racl_beta=2.0,
+                        racl_temperature=0.07,
+                        racl_num_negatives=50):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -69,6 +72,9 @@ class ClipMatcher(SetCriterion):
         self.focal_loss = True
         self.losses_dict = {}
         self._current_frame_idx = 0
+        self.racl_beta = racl_beta
+        self.racl_temperature = racl_temperature
+        self.racl_num_negatives = racl_num_negatives
 
     def initialize_for_single_clip(self, gt_instances: List[Instances], dataset_name=None):
         self.gt_instances = gt_instances
@@ -115,6 +121,7 @@ class ClipMatcher(SetCriterion):
             'cardinality': self.loss_cardinality,
             'boxes': self.loss_boxes,
             'refers': self.loss_refers,
+            'loss_contrastive': self.loss_contrastive,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, gt_instances, indices, num_boxes, **kwargs)
@@ -213,6 +220,52 @@ class ClipMatcher(SetCriterion):
 
         return losses
 
+    def loss_contrastive(self, outputs, gt_instances: List[Instances], indices: List[tuple], num_boxes, log=False):
+        if 'contrastive_visual' not in outputs or 'contrastive_text' not in outputs:
+            return {'loss_contrastive': outputs['pred_logits'].new_tensor(0.0)}
+
+        visual_embeds = outputs['contrastive_visual']
+        text_embeds = outputs['contrastive_text']
+        total_loss = visual_embeds.new_tensor(0.0)
+        valid_anchors = 0
+
+        for batch_id, (src_idx, tgt_idx) in enumerate(indices):
+            keep = tgt_idx != -1
+            src_idx = src_idx[keep]
+            tgt_idx = tgt_idx[keep]
+            if src_idx.numel() == 0:
+                continue
+
+            pred_boxes = outputs['pred_boxes'][batch_id, src_idx].detach()
+            target_boxes = gt_instances[batch_id].boxes[tgt_idx]
+            pred_xyxy = box_ops.box_cxcywh_to_xyxy(pred_boxes)
+            target_xyxy = box_ops.box_cxcywh_to_xyxy(target_boxes)
+            reliability = torch.diag(box_ops.box_iou(pred_xyxy, target_xyxy)[0]).clamp(0, 1)
+            reliability = reliability.pow(self.racl_beta).detach()
+
+            anchors = visual_embeds[batch_id, src_idx]
+            positive = text_embeds[batch_id].unsqueeze(0)
+            negative_mask = torch.ones(visual_embeds.shape[1], dtype=torch.bool, device=visual_embeds.device)
+            negative_mask[src_idx] = False
+            negatives = visual_embeds[batch_id, negative_mask]
+            if negatives.numel() == 0:
+                continue
+
+            pos_logits = anchors @ positive.t()
+            neg_logits = anchors @ negatives.t()
+            if self.racl_num_negatives > 0 and neg_logits.shape[1] > self.racl_num_negatives:
+                neg_logits = torch.topk(neg_logits, self.racl_num_negatives, dim=1).values
+
+            logits = torch.cat([pos_logits, neg_logits], dim=1) / self.racl_temperature
+            labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
+            per_anchor_loss = F.cross_entropy(logits, labels, reduction='none')
+            total_loss = total_loss + (per_anchor_loss * reliability).sum()
+            valid_anchors += src_idx.numel()
+
+        if valid_anchors == 0:
+            return {'loss_contrastive': total_loss}
+        return {'loss_contrastive': total_loss / valid_anchors}
+
     def match_for_single_frame(self, outputs: dict):
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
 
@@ -230,6 +283,9 @@ class ClipMatcher(SetCriterion):
             'pred_boxes': pred_boxes_i.unsqueeze(0), 
             'pred_refers': pred_refers_i.unsqueeze(0), 
         }
+        if 'contrastive_visual' in outputs_without_aux and 'contrastive_text' in outputs_without_aux:
+            outputs_i['contrastive_visual'] = outputs_without_aux['contrastive_visual']
+            outputs_i['contrastive_text'] = outputs_without_aux['contrastive_text']
 
 
         # step1. inherit and update the previous tracks.
@@ -307,7 +363,7 @@ class ClipMatcher(SetCriterion):
         # if is_crowdhuman:
         #     losses = ['labels', 'boxes']
         # else:
-        losses = ['labels', 'boxes', 'refers']
+        losses = ['labels', 'boxes', 'refers', 'loss_contrastive']
         for loss in losses:
             new_track_loss = self.get_loss(loss,
                                            outputs=outputs_i,
@@ -327,6 +383,8 @@ class ClipMatcher(SetCriterion):
                 matched_indices_layer = torch.cat([new_matched_indices_layer, prev_matched_indices], dim=0)
                 # losses = ['labels', 'boxes', 'scores']
                 for loss in losses:
+                    if loss == 'loss_contrastive':
+                        continue
                     if loss == 'masks':
                         # Intermediate masks losses are too costly to compute, we ignore them.
                         continue
@@ -465,7 +523,8 @@ def _get_clones(module, N):
 
 class TransRMOT(nn.Module):
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels, criterion, track_embed,
-                 aux_loss=True, with_box_refine=False, two_stage=False, memory_bank=None, use_checkpoint=False,tracking=False,hist_len=4):
+                 aux_loss=True, with_box_refine=False, two_stage=False, memory_bank=None, use_checkpoint=False,
+                 tracking=False, hist_len=4, text_encoder_path='roberta-base', text_encoder_local_files_only=False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -489,6 +548,16 @@ class TransRMOT(nn.Module):
         self.refer_embed = nn.Linear(hidden_dim, 1) # this is referring branch
         self.num_feature_levels = num_feature_levels
         self.use_checkpoint = use_checkpoint
+        self.contrastive_proj_img = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 128),
+        )
+        self.contrastive_proj_text = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 128),
+        )
         
         # Temporal Enhancement Module
         self.STReasoner = SpatialTemporalReasoner(hist_len=hist_len)
@@ -530,10 +599,14 @@ class TransRMOT(nn.Module):
         # self.text_encoder = RobertaModel.from_pretrained('/home/linzhongxu/code/kdgtrack/DKGTrack-main/work3/roberta_base',local_files_only=True)
         # self.text_encoder.pooler = None  # this pooler is never used, this is a hack to avoid DDP problems...
 
-        self.tokenizer = RobertaTokenizerFast.from_pretrained('/root/autodl-tmp/dkg_rmot/DKGTrack-main/work3/roberta_base/',
-                                                              local_files_only=True)
-        self.text_encoder = RobertaModel.from_pretrained('/root/autodl-tmp/dkg_rmot/DKGTrack-main/work3/roberta_base/',
-                                                         local_files_only=True)
+        self.tokenizer = RobertaTokenizerFast.from_pretrained(
+            text_encoder_path,
+            local_files_only=text_encoder_local_files_only,
+        )
+        self.text_encoder = RobertaModel.from_pretrained(
+            text_encoder_path,
+            local_files_only=text_encoder_local_files_only,
+        )
         self.nlp = spacy.load('en_core_web_sm')
         freeze_text_encoder = True
 
@@ -830,6 +903,9 @@ class TransRMOT(nn.Module):
         outputs_refer = torch.stack(outputs_refers)
         ref_pts_all = torch.cat([init_reference[None], inter_references[:, :, :, :2]], dim=0)
         last_query_feats = hs[-1]
+        visual_embeds = F.normalize(self.contrastive_proj_img(last_query_feats.detach()), p=2, dim=-1)
+        text_proto = text_sentence_features.mean(dim=1)
+        text_embeds = F.normalize(self.contrastive_proj_text(text_proto), p=2, dim=-1)
         # last_query_embeds = track_instances.query_embeds.clone()
         out = {
             'pred_logits': outputs_class[-1], 
@@ -837,6 +913,8 @@ class TransRMOT(nn.Module):
             'ref_pts': ref_pts_all[5], 
             'pred_refers': outputs_refer[-1],
             'query_feats':last_query_feats,
+            'contrastive_visual': visual_embeds,
+            'contrastive_text': text_embeds,
             }
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, outputs_refer)
@@ -1150,6 +1228,7 @@ def build(args):
                             'frame_{}_loss_bbox'.format(i): args.bbox_loss_coef,
                             'frame_{}_loss_giou'.format(i): args.giou_loss_coef,
                             'frame_{}_loss_refer'.format(i): args.refer_loss_coef,
+                            'frame_{}_loss_contrastive'.format(i): args.racl_loss_coef,
                             "frame_{}_temporal_loss_ce".format(i): args.cls_loss_coef,
                             'frame_{}_temporal_loss_bbox'.format(i): args.bbox_loss_coef,
                             'frame_{}_temporal_loss_giou'.format(i): args.giou_loss_coef,
@@ -1171,8 +1250,16 @@ def build(args):
             weight_dict.update({"frame_{}_track_loss_ce".format(i): args.cls_loss_coef})
     else:
         memory_bank = None
-    losses = ['labels', 'boxes', 'refers']
-    criterion = ClipMatcher(num_classes, matcher=img_matcher, weight_dict=weight_dict, losses=losses)
+    losses = ['labels', 'boxes', 'refers', 'loss_contrastive']
+    criterion = ClipMatcher(
+        num_classes,
+        matcher=img_matcher,
+        weight_dict=weight_dict,
+        losses=losses,
+        racl_beta=args.racl_beta,
+        racl_temperature=args.racl_temperature,
+        racl_num_negatives=args.racl_num_negatives,
+    )
     criterion.to(device)
     postprocessors = {}
     model = TransRMOT(
@@ -1188,7 +1275,9 @@ def build(args):
         two_stage=args.two_stage,
         memory_bank=memory_bank,
         use_checkpoint=args.use_checkpoint,
-        tracking = args.tracking,
-        hist_len = args.hist_len
+        tracking=args.tracking,
+        hist_len=args.hist_len,
+        text_encoder_path=args.text_encoder_path,
+        text_encoder_local_files_only=args.text_encoder_local_files_only,
     )
     return model, criterion, postprocessors

@@ -13,11 +13,12 @@ venv/
 .vscode/
 .idea/
 
-# 忽略大文件 (根据你的实际情况修改)
+# 忽略大文件和本地数据；不要忽略 datasets/ 代码包本身
 *.pth
 *.ckpt
 data/
-datasets/
+datasets/data/
+datasets/*/data/
 exps/
 work3/
 log/

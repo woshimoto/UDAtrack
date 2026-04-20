@@ -1,47 +1,21 @@
-#python3 run_mot_challenge.py \
-###
- # @Author: hcxpami 503429928@qq.com
- # @Date: 2024-11-06 09:55:45
- # @LastEditors: hcxpami 503429928@qq.com
- # @LastEditTime: 2024-11-09 11:54:31
- # @FilePath: /TempRMOT_original/TrackEval/scripts/evaluate_rmot.sh
- # @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
-### 
-#--METRICS HOTA \
-#--SEQMAP_FILE /data/wudongming/MOTR/seqmap_rmot_clean.txt \
-#--SKIP_SPLIT_FOL True \
-#--GT_FOLDER /data/Dataset/MOT17/images/train \
-#--TRACKERS_FOLDER /data/wudongming/MOTR/exps/rmot_v2a/results_epoch249_ \
-#--GT_LOC_FORMAT {gt_folder}{video_id}/{expression_id}/gt.txt \
-#--TRACKERS_TO_EVAL /data/wudongming/MOTR/exps/rmot_v2a/results_epoch249_ \
-#--USE_PARALLEL True \
-#--NUM_PARALLEL_CORES 2 \
-#--SKIP_SPLIT_FOL True \
-#--PLOT_CURVES False
-# export CUDA_VISIBLE_DEVICES='4,5,6'
+#!/usr/bin/env bash
+set -euo pipefail
 
-python3 run_mot_challenge.py \
---METRICS HOTA \
---SEQMAP_FILE /root/autodl-tmp/dkg_rmot/DKGTrack-main/datasets/data_path/refer-kitti/seqmap.txt \
---SKIP_SPLIT_FOL True \
---GT_FOLDER /root/autodl-tmp/Ref-KITTI/training/image_02 \
---TRACKERS_FOLDER /root/autodl-tmp/dkg_rmot/DKGTrack-main/exps/saved_models_rk/motion/results_epoch89 \
---GT_LOC_FORMAT {gt_folder}{video_id}/{expression_id}/gt.txt \
---TRACKERS_TO_EVAL /root/autodl-tmp/dkg_rmot/DKGTrack-main/exps/saved_models_rk/motion/results_epoch89 \
---USE_PARALLEL True \
---NUM_PARALLEL_CORES 2 \
---SKIP_SPLIT_FOL True \
---PLOT_CURVES False
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+SEQMAP_FILE="${SEQMAP_FILE:-${PROJECT_ROOT}/datasets/data_path/seqmap.txt}"
+GT_FOLDER="${GT_FOLDER:-/path/to/Refer-KITTI/training/image_02}"
+TRACKERS_FOLDER="${TRACKERS_FOLDER:-${PROJECT_ROOT}/exps/sgdp_track_refer_kitti/eval}"
+TRACKERS_TO_EVAL="${TRACKERS_TO_EVAL:-${TRACKERS_FOLDER}}"
+NUM_PARALLEL_CORES="${NUM_PARALLEL_CORES:-2}"
 
-#python3 run_mot_challenge.py \
-#--METRICS HOTA \
-#--SEQMAP_FILE /data/wudongming/MOTR/seqmap_kitti_clean.txt \
-#--SKIP_SPLIT_FOL True \
-#--GT_FOLDER /data/Dataset/KITTI/training/image_02 \
-#--TRACKERS_FOLDER /data/wudongming/FairMOT/exp/fairmot_kitti_2/result_epoch100 \
-#--GT_LOC_FORMAT {gt_folder}{video_id}/{expression_id}/gt.txt \
-#--TRACKERS_TO_EVAL /data/wudongming/FairMOT/exp/fairmot_kitti_2/result_epoch100 \
-#--USE_PARALLEL True \
-#--NUM_PARALLEL_CORES 2 \
-#--SKIP_SPLIT_FOL True \
-#--PLOT_CURVES False
+python3 "${PROJECT_ROOT}/TrackEval/scripts/run_mot_challenge.py" \
+  --METRICS HOTA \
+  --SEQMAP_FILE "${SEQMAP_FILE}" \
+  --SKIP_SPLIT_FOL True \
+  --GT_FOLDER "${GT_FOLDER}" \
+  --TRACKERS_FOLDER "${TRACKERS_FOLDER}" \
+  --GT_LOC_FORMAT "{gt_folder}{video_id}/{expression_id}/gt.txt" \
+  --TRACKERS_TO_EVAL "${TRACKERS_TO_EVAL}" \
+  --USE_PARALLEL True \
+  --NUM_PARALLEL_CORES "${NUM_PARALLEL_CORES}" \
+  --PLOT_CURVES False

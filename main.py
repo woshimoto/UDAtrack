@@ -131,6 +131,14 @@ def get_args_parser():
     parser.add_argument('--bbox_loss_coef', default=5, type=float)
     parser.add_argument('--giou_loss_coef', default=2, type=float)
     parser.add_argument('--refer_loss_coef', default=2, type=float)
+    parser.add_argument('--racl_loss_coef', default=1.0, type=float,
+                        help='loss weight for Reliability-Aware Contrastive Learning')
+    parser.add_argument('--racl_beta', default=2.0, type=float,
+                        help='IoU reliability exponent used by RACL')
+    parser.add_argument('--racl_temperature', default=0.07, type=float,
+                        help='InfoNCE temperature used by RACL')
+    parser.add_argument('--racl_num_negatives', default=50, type=int,
+                        help='number of hard negative query embeddings sampled by RACL')
     parser.add_argument('--focal_alpha', default=0.25, type=float)
 
     # dataset parameters
@@ -192,6 +200,12 @@ def get_args_parser():
     parser.add_argument('--hist_len', type=int, default=4)
     parser.add_argument('--lr_trans', type=float, default=1e-5)
     parser.add_argument('--save_dir', default='saved_models_rk/TRMOT_original')
+    parser.add_argument('--text_encoder_path', default=os.environ.get('TEXT_ENCODER_PATH', 'roberta-base'),
+                        help='HuggingFace model id or local directory for RoBERTa text encoder')
+    parser.add_argument('--text_encoder_local_files_only', action='store_true',
+                        help='load text encoder only from local files')
+    parser.add_argument('--sgdp_topk', default=300, type=int,
+                        help='number of semantic-relevant visual tokens retained by SGDP spatial pruning')
     # code end
     return parser
 

@@ -328,9 +328,11 @@ class Detector(object):
         self.checkpoint_id = checkpoint_id
 
         self.seq_num = seq_num
-        img_list = os.listdir(os.path.join(self.args.rmot_path, '/root/autodl-tmp/Ref-KITTI/KITTI/training/image_02/', self.seq_num[0]))
-        img_list = [os.path.join(self.args.rmot_path, '/root/autodl-tmp/Ref-KITTI/KITTI/training/image_02/', self.seq_num[0], _)
-                    for _ in img_list if ('jpg' in _) or ('png' in _)]
+        image_dir = os.path.join(self.args.rmot_path, 'KITTI', 'training', 'image_02', self.seq_num[0])
+        if not os.path.isdir(image_dir):
+            image_dir = os.path.join(self.args.rmot_path, 'images', self.seq_num[0])
+        img_list = os.listdir(image_dir)
+        img_list = [os.path.join(image_dir, _) for _ in img_list if ('jpg' in _) or ('png' in _)]
 
         self.img_list = sorted(img_list)
         self.img_len = len(self.img_list)
