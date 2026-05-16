@@ -42,5 +42,9 @@ python3 "${PROJECT_ROOT}/main.py" \
   --racl_beta 2 \
   --racl_temperature 0.07 \
   --racl_num_negatives 50 \
+  --cf_loss_coef 1 \
+  --unc_loss_coef 0.5 \
+  --cf_score_thresh 0.35 \
   --sgdp_topk 300 \
+  --sgdp_k_min 64 \
   --text_encoder_path "${TEXT_ENCODER_PATH}"

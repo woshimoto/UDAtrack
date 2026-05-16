@@ -4,8 +4,9 @@ Official implementation for **"Where to Look and What to Trust: Unified Feature 
 
 SGDP-Track is an end-to-end referring multi-object tracking framework. Given a video and a natural-language query, it detects and tracks all objects matching the expression. The method follows a **Purify-then-Rectify** design:
 
-- **Semantic-Guided Dual-Pruning (SGDP) decoder** filters spatial background tokens with static language prototypes and rectifies unreliable visual channels with an uncertainty gate.
-- **Reliability-Aware Contrastive Learning (RACL)** decouples the identity embedding branch from box regression and down-weights noisy contrastive supervision using localization quality.
+- **Reliability-conditioned semantic state** summarizes reliable track queries and conditions later token selection on language, identity, and localization trust.
+- **State-guided dual purification** adaptively keeps semantic visual tokens, mines high-response non-target tokens as counterfactual distractors, and rectifies unreliable visual channels with an uncertainty gate.
+- **Reliability-aware association learning** decouples the identity embedding branch from box regression, reuses reliable track memory, and down-weights noisy contrastive supervision using localization quality.
 - **Static/motion language prototypes** are extracted from the referring sentence to separately model appearance cues and motion cues.
 
 ![SGDP-Track framework](assets/framework.png)
@@ -91,11 +92,15 @@ bash configs/dkgtrack_rmot_train.sh
 
 Important method knobs:
 
-- `--sgdp_topk 300`: keeps the Top-K semantic visual tokens for SGDP spatial pruning.
+- `--sgdp_topk 300`: maximum semantic visual token budget for SGDP spatial pruning.
+- `--sgdp_k_min 64`: minimum token budget when adaptive Top-K is enabled.
+- `--semantic_state_momentum 0.8`: EMA momentum for the reliability-conditioned semantic state.
 - `--racl_loss_coef 1`: enables RACL in the total loss.
 - `--racl_beta 2`: uses quadratic IoU reliability weighting, matching the paper setting.
 - `--racl_temperature 0.07`: InfoNCE temperature.
 - `--racl_num_negatives 50`: number of hard negative query embeddings.
+- `--cf_loss_coef 1`: enables counterfactual distractor purification loss.
+- `--unc_loss_coef 0.5`: calibrates channel uncertainty against localization reliability.
 
 ## Inference
 
@@ -125,9 +130,10 @@ Reported results from the paper:
 
 ## Implementation Notes
 
-- SGDP spatial pruning is implemented in `DeformableTransformerDecoderLayer._semantic_topk_prune`.
-- SGDP channel rectification uses an uncertainty gate to fuse static and motion prototypes before query normalization.
-- RACL is implemented in `ClipMatcher.loss_contrastive`; query embeddings are detached before projection, and the loss is weighted by IoU reliability.
+- Reliability-conditioned semantic state is maintained in `TransRMOT._update_semantic_state` and passed into the transformer for the next frame.
+- Adaptive state-guided pruning is implemented in `DeformableTransformerDecoderLayer._semantic_topk_prune`.
+- Counterfactual distractor purification and uncertainty calibration are implemented in `ClipMatcher.loss_counterfactual` and `ClipMatcher.loss_uncertainty`.
+- RACL is implemented in `ClipMatcher.loss_contrastive`; query embeddings are detached before projection, weighted by IoU reliability, and compared against reliable track memory.
 - The text encoder path is configurable through `--text_encoder_path` or the `TEXT_ENCODER_PATH` environment variable.
 
 ## Acknowledgements
