@@ -2,10 +2,10 @@
 
 本文档说明当前分支 `codex/sgdp-track-improvements` 相对原始 UDAtrack / DKGTrack 代码做了哪些改进、改进代码在哪里、关键代码是什么，以及每一部分实现的功能。
 
-当前提交：
+当前分支：
 
 ```bash
-7add6e4 implement sgdp track improvements
+codex/sgdp-track-improvements
 ```
 
 ## 1. 改动文件总览
@@ -791,7 +791,34 @@ TEXT_ENCODER_PATH=/path/to/roberta_base \
 bash configs/dkgtrack_rmot_train.sh
 ```
 
-## 7. 数据流说明
+## 7. 消融实验开关
+
+为了配合新的 method 叙事，代码现在提供以下消融开关。默认不传这些参数时，运行完整模型。
+
+| 开关 | 作用 | 对应验证点 |
+| --- | --- | --- |
+| `--disable_semantic_state` | 不使用跨帧 semantic state，退化为当前文本 static prototype | 验证 language-conditioned semantic state |
+| `--disable_state_update` | 不更新 semantic state | 验证 state-safe temporal update |
+| `--disable_evidence_pruning` | cross-attention 保留全部视觉 evidence，但仍计算 evidence score | 验证 drift-aware evidence pruning |
+| `--disable_channel_rectification` | 关闭 static-motion channel rectification 和 uncertainty 输出 | 验证 uncertainty-gated query rectification |
+| `--cf_loss_coef 0` | 关闭 counterfactual evidence disambiguation loss | 验证 counterfactual distractor suppression |
+| `--unc_loss_coef 0` | 关闭 uncertainty calibration loss | 验证 uncertainty supervision |
+| `--racl_loss_coef 0` | 关闭辅助 identity separation loss | 验证身份分离辅助项 |
+
+推荐的核心消融命令形式：
+
+```bash
+DATA_ROOT=/path/to/refer-kitti-v2 \
+TRAIN_SPLIT=/path/to/refer-kitti-v2.train \
+PRETRAIN=/path/to/pretrain.pth \
+TEXT_ENCODER_PATH=/path/to/roberta_base \
+bash configs/dkgtrack_rmot_train.sh \
+  --disable_semantic_state
+```
+
+四个 train/test shell 脚本都支持在命令末尾追加参数，因此同一个脚本可以直接用于完整模型和不同消融设置。
+
+## 8. 数据流说明
 
 ### 7.1 前向传播数据流
 
@@ -838,7 +865,7 @@ track_instances
   -> EMA update _semantic_state
 ```
 
-## 8. 每个改进对应的论文含义
+## 9. 每个改进对应的论文含义
 
 | 代码模块 | 论文中的作用 | 解决的问题 |
 | --- | --- | --- |
@@ -849,7 +876,7 @@ track_instances
 | `loss_counterfactual` | Counterfactual distractor suppression | 显式惩罚高响应但非目标区域的干扰 token |
 | `loss_uncertainty` | Uncertainty calibration | 让模型知道哪些 query / 通道融合结果不可靠 |
 
-## 9. 服务器上如何定位这些代码
+## 10. 服务器上如何定位这些代码
 
 在服务器仓库目录执行：
 
@@ -881,7 +908,7 @@ sed -n '871,1125p' models/transrmot_pro.py
 sed -n '1440,1525p' models/transrmot_pro.py
 ```
 
-## 10. 训练前建议验证
+## 11. 训练前建议验证
 
 由于当前本地机器没有 PyTorch，完整 forward 和训练启动需要在服务器验证。建议按下面顺序执行：
 
@@ -924,7 +951,7 @@ TEXT_ENCODER_PATH=/path/to/roberta_base \
 bash configs/dkgtrack_rmot_train_rk.sh
 ```
 
-## 11. 可能需要重点观察的训练日志
+## 12. 可能需要重点观察的训练日志
 
 训练时建议重点确认 loss 字段是否出现：
 
@@ -952,7 +979,7 @@ loss_uncertainty
 --racl_num_negatives 20
 ```
 
-## 12. 小结
+## 13. 小结
 
 本次改进不是简单增加几个 loss，而是把视觉 token 选择、文本静态/运动原型、跨帧语义状态、query uncertainty 和可靠性加权训练串成了一条完整路径：
 

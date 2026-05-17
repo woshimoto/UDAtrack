@@ -382,6 +382,9 @@ class ClipMatcher(SetCriterion):
             return {'loss_uncertainty': outputs['pred_logits'].new_tensor(0.0)}
 
         uncertainty = outputs['query_uncertainty']
+        if not uncertainty.requires_grad:
+            return {'loss_uncertainty': outputs['pred_logits'].new_tensor(0.0)}
+
         total_loss = uncertainty.new_tensor(0.0)
         normalizer = uncertainty.new_tensor(0.0)
         for batch_id, (src_idx, tgt_idx) in enumerate(indices):
@@ -668,7 +671,8 @@ class TransRMOT(nn.Module):
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels, criterion, track_embed,
                  aux_loss=True, with_box_refine=False, two_stage=False, memory_bank=None, use_checkpoint=False,
                  tracking=False, hist_len=4, text_encoder_path='roberta-base', text_encoder_local_files_only=False,
-                 semantic_state_momentum=0.8, semantic_state_threshold=0.05):
+                 semantic_state_momentum=0.8, semantic_state_threshold=0.05,
+                 use_semantic_state=True, enable_state_update=True):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -688,6 +692,8 @@ class TransRMOT(nn.Module):
         hidden_dim = transformer.d_model 
         self.semantic_state_momentum = semantic_state_momentum
         self.semantic_state_threshold = semantic_state_threshold
+        self.use_semantic_state = use_semantic_state
+        self.enable_state_update = enable_state_update
         self._semantic_state = None
         self.num_classes = num_classes 
         self.class_embed = nn.Linear(hidden_dim, num_classes)
@@ -869,12 +875,14 @@ class TransRMOT(nn.Module):
         self._semantic_state = None
 
     def _get_semantic_state(self, fallback):
-        if self._semantic_state is None:
+        if not self.use_semantic_state or self._semantic_state is None:
             return fallback
         return self._semantic_state.to(fallback.device, fallback.dtype)
 
     @torch.no_grad()
     def _update_semantic_state(self, track_instances: Instances, training: bool):
+        if not self.use_semantic_state or not self.enable_state_update:
+            return
         if not track_instances.has('output_embedding') or len(track_instances) == 0:
             return
 
@@ -1123,6 +1131,17 @@ class TransRMOT(nn.Module):
                 out['sgdp_token_keep'] = sgdp_aux['token_keep']
             if 'query_uncertainty' in sgdp_aux:
                 out['query_uncertainty'] = sgdp_aux['query_uncertainty']
+        batch_size, num_queries = outputs_class[-1].shape[:2]
+        if 'query_uncertainty' not in out:
+            out['query_uncertainty'] = outputs_class[-1].new_zeros((batch_size, num_queries))
+        if 'sgdp_token_scores' not in out:
+            out['sgdp_token_scores'] = outputs_class[-1].new_zeros((batch_size, 0))
+        if 'sgdp_token_features' not in out:
+            out['sgdp_token_features'] = last_query_feats.new_zeros((batch_size, 0, last_query_feats.shape[-1]))
+        if 'sgdp_token_centers' not in out:
+            out['sgdp_token_centers'] = outputs_coord[-1].new_zeros((batch_size, 0, 2))
+        if 'sgdp_token_keep' not in out:
+            out['sgdp_token_keep'] = torch.zeros((batch_size, 0), dtype=torch.bool, device=outputs_class.device)
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, outputs_refer)
         out['text_word_mask'] = text_word_mask 
@@ -1360,7 +1379,10 @@ class TransRMOT(nn.Module):
             frame.requires_grad = False
             is_last = frame_index == len(frames) - 1
             if self.use_checkpoint and frame_index < len(frames) - 1:
-                semantic_state_for_checkpoint = None if self._semantic_state is None else self._semantic_state.detach()
+                if not self.use_semantic_state or self._semantic_state is None:
+                    semantic_state_for_checkpoint = None
+                else:
+                    semantic_state_for_checkpoint = self._semantic_state.detach()
 
                 def fn(frame, *args):
                     frame = nested_tensor_from_tensor_list([frame])
@@ -1518,5 +1540,7 @@ def build(args):
         text_encoder_local_files_only=args.text_encoder_local_files_only,
         semantic_state_momentum=args.semantic_state_momentum,
         semantic_state_threshold=args.semantic_state_threshold,
+        use_semantic_state=not args.disable_semantic_state,
+        enable_state_update=not args.disable_state_update,
     )
     return model, criterion, postprocessors

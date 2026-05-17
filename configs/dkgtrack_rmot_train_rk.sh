@@ -46,4 +46,5 @@ python3 -m torch.distributed.run --nproc_per_node="${NPROC}" --master_port "${MA
   --cf_score_thresh 0.35 \
   --sgdp_topk 300 \
   --sgdp_k_min 64 \
-  --text_encoder_path "${TEXT_ENCODER_PATH}"
+  --text_encoder_path "${TEXT_ENCODER_PATH}" \
+  "$@"

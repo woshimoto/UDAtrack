@@ -36,7 +36,8 @@ class DeformableTransformer(nn.Module):
                  activation="relu", return_intermediate_dec=False,
                  num_feature_levels=4, dec_n_points=4,  enc_n_points=4,
                  two_stage=False, two_stage_num_proposals=300, decoder_self_cross=True, sigmoid_attn=False,
-                 extra_track_attn=False, sgdp_topk=300, sgdp_k_min=64, sgdp_adaptive_topk=True):
+                 extra_track_attn=False, sgdp_topk=300, sgdp_k_min=64, sgdp_adaptive_topk=True,
+                 enable_evidence_pruning=True, enable_channel_rectification=True):
         super().__init__()
 
         self.new_frame_adaptor = None
@@ -66,7 +67,9 @@ class DeformableTransformer(nn.Module):
                                                           sigmoid_attn=sigmoid_attn, extra_track_attn=extra_track_attn,
                                                           sgdp_topk=sgdp_topk,
                                                           sgdp_k_min=sgdp_k_min,
-                                                          sgdp_adaptive_topk=sgdp_adaptive_topk)
+                                                          sgdp_adaptive_topk=sgdp_adaptive_topk,
+                                                          enable_evidence_pruning=enable_evidence_pruning,
+                                                          enable_channel_rectification=enable_channel_rectification)
         
         self.decoder = DeformableTransformerDecoder(decoder_layer, feature_fusion_layer, num_decoder_layers, d_model, nhead, 
                                                     dim_feedforward, dropout, activation,return_intermediate=return_intermediate_dec)
@@ -315,7 +318,8 @@ class DeformableTransformerDecoderLayer(nn.Module):
     def __init__(self, d_model=256, d_ffn=1024,
                  dropout=0.1, activation="relu",
                  n_levels=4, n_heads=8, n_points=4, self_cross=True, sigmoid_attn=False, extra_track_attn=False,
-                 sgdp_topk=300, sgdp_k_min=64, sgdp_adaptive_topk=True):
+                 sgdp_topk=300, sgdp_k_min=64, sgdp_adaptive_topk=True,
+                 enable_evidence_pruning=True, enable_channel_rectification=True):
         super().__init__()
 
         self.self_cross = self_cross
@@ -323,6 +327,8 @@ class DeformableTransformerDecoderLayer(nn.Module):
         self.sgdp_topk = sgdp_topk
         self.sgdp_k_min = sgdp_k_min
         self.sgdp_adaptive_topk = sgdp_adaptive_topk
+        self.enable_evidence_pruning = enable_evidence_pruning
+        self.enable_channel_rectification = enable_channel_rectification
 
         # cross attention
         self.cross_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points, sigmoid_attn=sigmoid_attn)
@@ -420,11 +426,13 @@ class DeformableTransformerDecoderLayer(nn.Module):
         if src_padding_mask is not None:
             score = score.masked_fill(src_padding_mask, float("-inf"))
 
+        valid = torch.isfinite(score)
         keep = torch.zeros_like(score, dtype=torch.bool)
-        if self.sgdp_topk <= 0:
+        if not self.enable_evidence_pruning:
+            keep = valid
+        elif self.sgdp_topk <= 0:
             keep = torch.isfinite(score)
         else:
-            valid = torch.isfinite(score)
             max_valid = valid.sum(dim=1).clamp(min=1)
             k_max = min(self.sgdp_topk, score.shape[-1])
             k_min = min(max(self.sgdp_k_min, 1), k_max)
@@ -464,7 +472,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
                                src, src_spatial_shapes, level_start_index, src_padding_mask)
 
         # === SGDP Channel Pruning ===
-        if static_feat is not None and motion_feat is not None:
+        if self.enable_channel_rectification and static_feat is not None and motion_feat is not None:
             alpha = self.channel_gate(tgt2)
             lang_refined = alpha * static_feat + (1 - alpha) * motion_feat
             tgt = tgt + self.dropout1(tgt2) + self.beta * lang_refined
@@ -501,7 +509,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
                                src, src_spatial_shapes, level_start_index, src_padding_mask)
 
         # === SGDP Channel Pruning ===
-        if static_feat is not None and motion_feat is not None:
+        if self.enable_channel_rectification and static_feat is not None and motion_feat is not None:
             alpha = self.channel_gate(tgt2)
             lang_refined = alpha * static_feat + (1 - alpha) * motion_feat
             tgt = tgt + self.dropout1(tgt2) + self.beta * lang_refined
@@ -964,4 +972,6 @@ def build_deforamble_transformer(args):
         sgdp_topk=args.sgdp_topk,
         sgdp_k_min=args.sgdp_k_min,
         sgdp_adaptive_topk=args.sgdp_adaptive_topk,
+        enable_evidence_pruning=not args.disable_evidence_pruning,
+        enable_channel_rectification=not args.disable_channel_rectification,
     )
