@@ -975,6 +975,7 @@ class TransRMOT(nn.Module):
         # static_feat: (Num_Static_Tokens, Hidden_Dim) -> e.g., (2, 256)
         # motion_feat: (Num_Motion_Tokens, Hidden_Dim)
         text_sentence_features, text_word_mask, text_word_features,  motion_map, subject_map, static_map, motion_feat, static_feat, subject_feat = self.forward_text(sentences, motion_map, subject_map, static_map, src.device)
+        sentence_embeds = text_sentence_features
 
         # === 1. 新增：计算 SGDP 所需的原型向量 (Prototypes) ===
         # 将 token 序列聚合为单个向量，用于空间门控和通道门控
@@ -982,7 +983,7 @@ class TransRMOT(nn.Module):
             static_prototype = static_feat.mean(dim=0).view(1, 1, -1) # [1, 1, C]
         else:
             # Fallback: 如果没有静态词，使用整句特征的均值
-            static_prototype = text_sentence_features.mean(dim=1).view(1, 1, -1)
+            static_prototype = sentence_embeds.mean(dim=0, keepdim=True).view(1, 1, -1)
 
         if motion_feat.size(0) > 0:
             motion_prototype = motion_feat.mean(dim=0).view(1, 1, -1) # [1, 1, C]
@@ -995,7 +996,6 @@ class TransRMOT(nn.Module):
             semantic_state = semantic_state_override.to(static_prototype.device, static_prototype.dtype)
         # =======================================================
 
-        text_sentence_features = text_sentence_features.flatten(0, 1).unsqueeze(0)
         text_word_mask = text_word_mask.flatten(0, 1).unsqueeze(0)
         text_pos = self.text_pos(NestedTensor(text_word_features, text_word_mask)).permute(2, 0, 1)
         subject_mask = torch.zeros((1, subject_feat.size(0)), dtype=torch.bool).to(src.device) 
@@ -1014,7 +1014,7 @@ class TransRMOT(nn.Module):
             "motion_map": motion_map,
             "subject_map": subject_map,
             "static_map": static_map,
-            "text_word_features": text_sentence_features,
+            "text_word_features": sentence_embeds,
             "motion_feat": motion_feat,
             "static_feat": static_feat, # 注意：这里依然是序列形式，供 Fusion Module 使用
             "subject_feat": subject_feat,
@@ -1072,7 +1072,7 @@ class TransRMOT(nn.Module):
         # === 2. 修改 Transformer 调用，传入 Prototypes ===
         hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, sgdp_aux = \
             self.transformer(srcs, masks, pos, track_instances.query_pos, 
-                             text_sentence_features, text_dict, 
+                             sentence_embeds, text_dict,
                              ref_pts=track_instances.ref_pts,
                              static_feat=static_prototype,   # <--- 新增
                              motion_feat=motion_prototype,
@@ -1108,7 +1108,7 @@ class TransRMOT(nn.Module):
         ref_pts_all = torch.cat([init_reference[None], inter_references[:, :, :, :2]], dim=0)
         last_query_feats = hs[-1]
         visual_embeds = F.normalize(self.contrastive_proj_img(last_query_feats.detach()), p=2, dim=-1)
-        text_proto = text_sentence_features.mean(dim=1)
+        text_proto = sentence_embeds
         text_embeds = F.normalize(self.contrastive_proj_text(text_proto), p=2, dim=-1)
         # last_query_embeds = track_instances.query_embeds.clone()
         out = {
