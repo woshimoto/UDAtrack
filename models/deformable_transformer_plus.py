@@ -36,7 +36,8 @@ class DeformableTransformer(nn.Module):
                  activation="relu", return_intermediate_dec=False,
                  num_feature_levels=4, dec_n_points=4,  enc_n_points=4,
                  two_stage=False, two_stage_num_proposals=300, decoder_self_cross=True, sigmoid_attn=False,
-                 extra_track_attn=False, sgdp_topk=300):
+                 extra_track_attn=False, sgdp_topk=300, sgdp_k_min=64, sgdp_adaptive_topk=True,
+                 enable_evidence_pruning=True, enable_channel_rectification=True):
         super().__init__()
 
         self.new_frame_adaptor = None
@@ -64,7 +65,11 @@ class DeformableTransformer(nn.Module):
                                                           dropout, activation,
                                                           num_feature_levels, nhead, dec_n_points, decoder_self_cross,
                                                           sigmoid_attn=sigmoid_attn, extra_track_attn=extra_track_attn,
-                                                          sgdp_topk=sgdp_topk)
+                                                          sgdp_topk=sgdp_topk,
+                                                          sgdp_k_min=sgdp_k_min,
+                                                          sgdp_adaptive_topk=sgdp_adaptive_topk,
+                                                          enable_evidence_pruning=enable_evidence_pruning,
+                                                          enable_channel_rectification=enable_channel_rectification)
         
         self.decoder = DeformableTransformerDecoder(decoder_layer, feature_fusion_layer, num_decoder_layers, d_model, nhead, 
                                                     dim_feedforward, dropout, activation,return_intermediate=return_intermediate_dec)
@@ -150,7 +155,7 @@ class DeformableTransformer(nn.Module):
         return valid_ratio
 
     def forward(self, srcs, masks, pos_embeds, query_embed=None, sentence_embeds=None, text_dict=None, ref_pts=None,
-                static_feat=None, motion_feat=None):
+                static_feat=None, motion_feat=None, semantic_state=None):
         assert self.two_stage or query_embed is not None
 
         # prepare input for encoder
@@ -211,14 +216,31 @@ class DeformableTransformer(nn.Module):
         # memory_text, mask_text, memory_sentence = self.forward_text(sentences, src.device) # words * expressions * dimension
 
         # decoder
-        hs, inter_references = self.decoder(tgt, reference_points, memory, spatial_shapes, level_start_index,
-                                            valid_ratios, query_embed, mask_flatten, lvl_pos_embed_flatten, sentence_embeds, text_dict,
-                                            static_feat=static_feat, motion_feat=motion_feat)
+        token_centers = self.get_token_centers(spatial_shapes, valid_ratios, memory.device)
+        hs, inter_references, sgdp_aux = self.decoder(tgt, reference_points, memory, spatial_shapes, level_start_index,
+                                                      valid_ratios, query_embed, mask_flatten, lvl_pos_embed_flatten, sentence_embeds, text_dict,
+                                                      static_feat=static_feat, motion_feat=motion_feat,
+                                                      semantic_state=semantic_state,
+                                                      token_centers=token_centers)
 
         inter_references_out = inter_references
         if self.two_stage:
-            return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact
-        return hs, init_reference_out, inter_references_out, None, None
+            return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact, sgdp_aux
+        return hs, init_reference_out, inter_references_out, None, None, sgdp_aux
+
+    @staticmethod
+    def get_token_centers(spatial_shapes, valid_ratios, device):
+        centers = []
+        bs = valid_ratios.shape[0]
+        for lvl, (h, w) in enumerate(spatial_shapes.tolist()):
+            ref_y, ref_x = torch.meshgrid(
+                torch.linspace(0.5, h - 0.5, h, dtype=torch.float32, device=device),
+                torch.linspace(0.5, w - 0.5, w, dtype=torch.float32, device=device),
+            )
+            ref_y = ref_y.reshape(1, -1).repeat(bs, 1) / (valid_ratios[:, None, lvl, 1] * h)
+            ref_x = ref_x.reshape(1, -1).repeat(bs, 1) / (valid_ratios[:, None, lvl, 0] * w)
+            centers.append(torch.stack((ref_x, ref_y), dim=-1))
+        return torch.cat(centers, dim=1).clamp(0, 1)
 
 
 class DeformableTransformerEncoderLayer(nn.Module):
@@ -296,12 +318,17 @@ class DeformableTransformerDecoderLayer(nn.Module):
     def __init__(self, d_model=256, d_ffn=1024,
                  dropout=0.1, activation="relu",
                  n_levels=4, n_heads=8, n_points=4, self_cross=True, sigmoid_attn=False, extra_track_attn=False,
-                 sgdp_topk=300):
+                 sgdp_topk=300, sgdp_k_min=64, sgdp_adaptive_topk=True,
+                 enable_evidence_pruning=True, enable_channel_rectification=True):
         super().__init__()
 
         self.self_cross = self_cross
         self.num_head = n_heads
         self.sgdp_topk = sgdp_topk
+        self.sgdp_k_min = sgdp_k_min
+        self.sgdp_adaptive_topk = sgdp_adaptive_topk
+        self.enable_evidence_pruning = enable_evidence_pruning
+        self.enable_channel_rectification = enable_channel_rectification
 
         # cross attention
         self.cross_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points, sigmoid_attn=sigmoid_attn)
@@ -335,6 +362,8 @@ class DeformableTransformerDecoderLayer(nn.Module):
 
         # === SGDP Modules ===
         self.spatial_gate = nn.Sequential(
+            nn.Linear(d_model * 3, d_model),
+            nn.ReLU(),
             nn.Linear(d_model, d_model // 4),
             nn.ReLU(),
             nn.Linear(d_model // 4, 1),
@@ -382,29 +411,57 @@ class DeformableTransformerDecoderLayer(nn.Module):
             tgt = torch.cat([tgt[:, :300],self.norm4(tgt[:, 300:]+self.dropout5(tgt2))], dim=1)
         return tgt
 
-    def _semantic_topk_prune(self, src, static_feat, src_padding_mask=None):
-        semantic_response = src * static_feat
-        spatial_score = self.spatial_gate(semantic_response)
-        if self.sgdp_topk <= 0 or self.sgdp_topk >= spatial_score.shape[0]:
-            return src * spatial_score
+    def _semantic_topk_prune(self, src, static_feat, motion_feat=None, semantic_state=None, src_padding_mask=None):
+        if motion_feat is None:
+            motion_feat = torch.zeros_like(static_feat)
+        if semantic_state is None:
+            semantic_state = static_feat
 
+        semantic_response = torch.cat(
+            [src * static_feat, src * motion_feat, src * semantic_state],
+            dim=-1,
+        )
+        spatial_score = self.spatial_gate(semantic_response)
         score = spatial_score.squeeze(-1).transpose(0, 1)
         if src_padding_mask is not None:
             score = score.masked_fill(src_padding_mask, float("-inf"))
 
-        topk = min(self.sgdp_topk, score.shape[-1])
+        valid = torch.isfinite(score)
         keep = torch.zeros_like(score, dtype=torch.bool)
-        keep.scatter_(1, torch.topk(score, topk, dim=1).indices, True)
+        if not self.enable_evidence_pruning:
+            keep = valid
+        elif self.sgdp_topk <= 0:
+            keep = torch.isfinite(score)
+        else:
+            max_valid = valid.sum(dim=1).clamp(min=1)
+            k_max = min(self.sgdp_topk, score.shape[-1])
+            k_min = min(max(self.sgdp_k_min, 1), k_max)
+            if self.sgdp_adaptive_topk and k_min < k_max:
+                safe_score = score.masked_fill(~valid, 0.0).clamp_min(1e-6)
+                prob = safe_score / safe_score.sum(dim=1, keepdim=True).clamp_min(1e-6)
+                entropy = -(prob * prob.clamp_min(1e-6).log()).sum(dim=1)
+                entropy = entropy / max(math.log(score.shape[-1]), 1e-6)
+                budgets = k_min + ((k_max - k_min) * entropy).floor().long()
+            else:
+                budgets = score.new_full((score.shape[0],), k_max, dtype=torch.long)
+            budgets = torch.minimum(budgets, max_valid)
+            for b, budget in enumerate(budgets.tolist()):
+                if budget > 0:
+                    keep[b].scatter_(0, torch.topk(score[b], budget, dim=0).indices, True)
         keep = keep.transpose(0, 1).unsqueeze(-1).to(src.dtype)
-        return src * keep
+        pruned_src = src * keep
+        return pruned_src, spatial_score.squeeze(-1).transpose(0, 1), keep.squeeze(-1).transpose(0, 1).bool(), src.transpose(0, 1)
 
     def _forward_self_cross(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index,
                             src_padding_mask=None, attn_mask=None, lvl_pos_embed_flatten=None,
-                            static_feat=None, motion_feat=None):
+                            static_feat=None, motion_feat=None, semantic_state=None):
         
         # === SGDP Spatial Pruning ===
+        sgdp_info = None
         if static_feat is not None:
-             src = self._semantic_topk_prune(src, static_feat, src_padding_mask)
+             src, token_scores, token_keep, token_features = self._semantic_topk_prune(
+                 src, static_feat, motion_feat, semantic_state, src_padding_mask)
+             sgdp_info = {'token_scores': token_scores, 'token_keep': token_keep, 'token_features': token_features}
 
         # self attention
         src = src.transpose(0, 1)
@@ -415,27 +472,36 @@ class DeformableTransformerDecoderLayer(nn.Module):
                                src, src_spatial_shapes, level_start_index, src_padding_mask)
 
         # === SGDP Channel Pruning ===
-        if static_feat is not None and motion_feat is not None:
+        if self.enable_channel_rectification and static_feat is not None and motion_feat is not None:
             alpha = self.channel_gate(tgt2)
             lang_refined = alpha * static_feat + (1 - alpha) * motion_feat
             tgt = tgt + self.dropout1(tgt2) + self.beta * lang_refined
+            query_uncertainty = alpha.mean(dim=-1)
         else:
             tgt = tgt + self.dropout1(tgt2)
+            query_uncertainty = None
 
         tgt = self.norm1(tgt)
 
         # ffn
         tgt = self.forward_ffn(tgt)
 
-        return tgt
+        if sgdp_info is None:
+            sgdp_info = {}
+        if query_uncertainty is not None:
+            sgdp_info['query_uncertainty'] = query_uncertainty
+        return tgt, sgdp_info
 
     def _forward_cross_self(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index,
                             src_padding_mask=None, attn_mask=None, lvl_pos_embed_flatten=None,
-                            static_feat=None, motion_feat=None):
+                            static_feat=None, motion_feat=None, semantic_state=None):
         
         # === SGDP Spatial Pruning ===
+        sgdp_info = None
         if static_feat is not None:
-             src = self._semantic_topk_prune(src, static_feat, src_padding_mask)
+             src, token_scores, token_keep, token_features = self._semantic_topk_prune(
+                 src, static_feat, motion_feat, semantic_state, src_padding_mask)
+             sgdp_info = {'token_scores': token_scores, 'token_keep': token_keep, 'token_features': token_features}
 
         # cross attention
         tgt2 = self.cross_attn(self.with_pos_embed(tgt, query_pos),
@@ -443,12 +509,14 @@ class DeformableTransformerDecoderLayer(nn.Module):
                                src, src_spatial_shapes, level_start_index, src_padding_mask)
 
         # === SGDP Channel Pruning ===
-        if static_feat is not None and motion_feat is not None:
+        if self.enable_channel_rectification and static_feat is not None and motion_feat is not None:
             alpha = self.channel_gate(tgt2)
             lang_refined = alpha * static_feat + (1 - alpha) * motion_feat
             tgt = tgt + self.dropout1(tgt2) + self.beta * lang_refined
+            query_uncertainty = alpha.mean(dim=-1)
         else:
             tgt = tgt + self.dropout1(tgt2)
+            query_uncertainty = None
 
         tgt = self.norm1(tgt)
         # self attention
@@ -456,19 +524,23 @@ class DeformableTransformerDecoderLayer(nn.Module):
         # ffn
         tgt = self.forward_ffn(tgt)
 
-        return tgt
+        if sgdp_info is None:
+            sgdp_info = {}
+        if query_uncertainty is not None:
+            sgdp_info['query_uncertainty'] = query_uncertainty
+        return tgt, sgdp_info
 
     def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index,
                 src_padding_mask=None, lvl_pos_embed_flatten=None,
-                static_feat=None, motion_feat=None):
+                static_feat=None, motion_feat=None, semantic_state=None):
         attn_mask = None
         if self.self_cross:# True
             return self._forward_self_cross(tgt, query_pos, reference_points, src, src_spatial_shapes,
                                             level_start_index, src_padding_mask, attn_mask, lvl_pos_embed_flatten,
-                                            static_feat, motion_feat)
+                                            static_feat, motion_feat, semantic_state)
         return self._forward_cross_self(tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index,
                                         src_padding_mask, attn_mask, lvl_pos_embed_flatten,
-                                        static_feat, motion_feat)
+                                        static_feat, motion_feat, semantic_state)
 
 
 class DeformableTransformerDecoder(nn.Module):
@@ -520,7 +592,7 @@ class DeformableTransformerDecoder(nn.Module):
         
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,
                 query_pos=None, src_padding_mask=None, lvl_pos_embed_flatten=None, sentence_embeds=None, text_dict=None,
-                static_feat=None, motion_feat=None):
+                static_feat=None, motion_feat=None, semantic_state=None, token_centers=None):
         b, n, c = tgt.shape
         # output = repeat(sentence_embeds, 'b c -> b n c', n=n) + tgt # rmot_4a
         sentence_embeds = repeat(sentence_embeds, 'b c -> b n c', n=n).transpose(1,0) # rmot_4
@@ -531,6 +603,7 @@ class DeformableTransformerDecoder(nn.Module):
 
         intermediate = []
         intermediate_reference_points = []
+        sgdp_aux = {}
         for lid, layer in enumerate(self.layers):
             if reference_points.shape[-1] == 4:
                 reference_points_input = reference_points[:, :, None] \
@@ -545,9 +618,14 @@ class DeformableTransformerDecoder(nn.Module):
                                     attention_mask_l=None,
                                     )
             
-            output = layer(output, query_pos, reference_points_input, src_level, src_spatial_shapes, src_level_start_index,
-                           src_padding_mask, lvl_pos_embed_flatten,
-                           static_feat=static_feat, motion_feat=motion_feat)
+            output, layer_sgdp_aux = layer(output, query_pos, reference_points_input, src_level, src_spatial_shapes, src_level_start_index,
+                                           src_padding_mask, lvl_pos_embed_flatten,
+                                           static_feat=static_feat, motion_feat=motion_feat,
+                                           semantic_state=semantic_state)
+            if layer_sgdp_aux:
+                sgdp_aux = layer_sgdp_aux
+                if token_centers is not None:
+                    sgdp_aux['token_centers'] = token_centers
             
             output = self.cross_test[lid]( 
                 output,
@@ -583,9 +661,9 @@ class DeformableTransformerDecoder(nn.Module):
                 intermediate_reference_points.append(reference_points)
 
         if self.return_intermediate:
-            return torch.stack(intermediate), torch.stack(intermediate_reference_points)
+            return torch.stack(intermediate), torch.stack(intermediate_reference_points), sgdp_aux
 
-        return output, reference_points,query_pos,
+        return output, reference_points, sgdp_aux
 
 
 def _get_clones(module, N):
@@ -892,4 +970,8 @@ def build_deforamble_transformer(args):
         sigmoid_attn=args.sigmoid_attn,
         extra_track_attn=args.extra_track_attn,
         sgdp_topk=args.sgdp_topk,
+        sgdp_k_min=args.sgdp_k_min,
+        sgdp_adaptive_topk=args.sgdp_adaptive_topk,
+        enable_evidence_pruning=not args.disable_evidence_pruning,
+        enable_channel_rectification=not args.disable_channel_rectification,
     )

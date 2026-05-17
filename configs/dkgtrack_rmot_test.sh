@@ -31,4 +31,6 @@ python3 "${PROJECT_ROOT}/inference.py" \
   --resume "${CHECKPOINT}" \
   --output_dir "${OUTPUT_DIR}" \
   --sgdp_topk 300 \
-  --text_encoder_path "${TEXT_ENCODER_PATH}"
+  --sgdp_k_min 64 \
+  --text_encoder_path "${TEXT_ENCODER_PATH}" \
+  "$@"

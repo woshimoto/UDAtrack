@@ -139,6 +139,12 @@ def get_args_parser():
                         help='InfoNCE temperature used by RACL')
     parser.add_argument('--racl_num_negatives', default=50, type=int,
                         help='number of hard negative query embeddings sampled by RACL')
+    parser.add_argument('--cf_loss_coef', default=1.0, type=float,
+                        help='loss weight for counterfactual distractor purification')
+    parser.add_argument('--unc_loss_coef', default=0.5, type=float,
+                        help='loss weight for channel uncertainty calibration')
+    parser.add_argument('--cf_score_thresh', default=0.35, type=float,
+                        help='semantic score threshold used to mine counterfactual distractor tokens')
     parser.add_argument('--focal_alpha', default=0.25, type=float)
 
     # dataset parameters
@@ -206,6 +212,24 @@ def get_args_parser():
                         help='load text encoder only from local files')
     parser.add_argument('--sgdp_topk', default=300, type=int,
                         help='number of semantic-relevant visual tokens retained by SGDP spatial pruning')
+    parser.add_argument('--sgdp_k_min', default=64, type=int,
+                        help='minimum token budget for adaptive SGDP pruning')
+    parser.add_argument('--sgdp_adaptive_topk', action='store_true', default=True,
+                        help='adapt SGDP token budget from semantic-score entropy')
+    parser.add_argument('--sgdp_disable_adaptive_topk', dest='sgdp_adaptive_topk', action='store_false',
+                        help='use fixed --sgdp_topk instead of entropy-adaptive SGDP budget')
+    parser.add_argument('--semantic_state_momentum', default=0.8, type=float,
+                        help='EMA momentum for reliability-conditioned semantic state')
+    parser.add_argument('--semantic_state_threshold', default=0.05, type=float,
+                        help='minimum reliability required to update the semantic state')
+    parser.add_argument('--disable_semantic_state', action='store_true',
+                        help='ablation: replace temporal semantic state with the static language prototype')
+    parser.add_argument('--disable_state_update', action='store_true',
+                        help='ablation: keep the semantic state frozen during a clip')
+    parser.add_argument('--disable_channel_rectification', action='store_true',
+                        help='ablation: disable uncertainty-gated static-motion query rectification')
+    parser.add_argument('--disable_evidence_pruning', action='store_true',
+                        help='ablation: keep all visual evidence in cross-attention while still computing evidence scores')
     # code end
     return parser
 
