@@ -25,6 +25,7 @@ from util.box_ops import box_cxcywh_to_xyxy
 from models.ops.modules import MSDeformAttn
 from einops import rearrange, repeat
 from .fuse_modules import BiAttentionBlock
+from .driftguard import select_evidence_mask
 
 # from transformers import RobertaModel, RobertaTokenizerFast
 #
@@ -36,7 +37,8 @@ class DeformableTransformer(nn.Module):
                  activation="relu", return_intermediate_dec=False,
                  num_feature_levels=4, dec_n_points=4,  enc_n_points=4,
                  two_stage=False, two_stage_num_proposals=300, decoder_self_cross=True, sigmoid_attn=False,
-                 extra_track_attn=False, sgdp_topk=300, sgdp_k_min=64, sgdp_adaptive_topk=True,
+                 extra_track_attn=False, evidence_topk=96, evidence_score_thresh=0.35,
+                 rectification_strength=0.1,
                  enable_evidence_pruning=True, enable_channel_rectification=True):
         super().__init__()
 
@@ -65,9 +67,9 @@ class DeformableTransformer(nn.Module):
                                                           dropout, activation,
                                                           num_feature_levels, nhead, dec_n_points, decoder_self_cross,
                                                           sigmoid_attn=sigmoid_attn, extra_track_attn=extra_track_attn,
-                                                          sgdp_topk=sgdp_topk,
-                                                          sgdp_k_min=sgdp_k_min,
-                                                          sgdp_adaptive_topk=sgdp_adaptive_topk,
+                                                          evidence_topk=evidence_topk,
+                                                          evidence_score_thresh=evidence_score_thresh,
+                                                          rectification_strength=rectification_strength,
                                                           enable_evidence_pruning=enable_evidence_pruning,
                                                           enable_channel_rectification=enable_channel_rectification)
         
@@ -155,7 +157,8 @@ class DeformableTransformer(nn.Module):
         return valid_ratio
 
     def forward(self, srcs, masks, pos_embeds, query_embed=None, sentence_embeds=None, text_dict=None, ref_pts=None,
-                static_feat=None, motion_feat=None, semantic_state=None):
+                static_feat=None, motion_feat=None, track_states=None, track_state_valid=None,
+                track_boxes=None):
         assert self.two_stage or query_embed is not None
 
         # prepare input for encoder
@@ -216,12 +219,17 @@ class DeformableTransformer(nn.Module):
         # memory_text, mask_text, memory_sentence = self.forward_text(sentences, src.device) # words * expressions * dimension
 
         # decoder
-        token_centers = self.get_token_centers(spatial_shapes, valid_ratios, memory.device)
+        token_centers, token_scales = self.get_token_geometry(
+            spatial_shapes, valid_ratios, memory.device
+        )
         hs, inter_references, sgdp_aux = self.decoder(tgt, reference_points, memory, spatial_shapes, level_start_index,
                                                       valid_ratios, query_embed, mask_flatten, lvl_pos_embed_flatten, sentence_embeds, text_dict,
                                                       static_feat=static_feat, motion_feat=motion_feat,
-                                                      semantic_state=semantic_state,
-                                                      token_centers=token_centers)
+                                                      track_states=track_states,
+                                                      track_state_valid=track_state_valid,
+                                                      track_boxes=track_boxes,
+                                                      token_centers=token_centers,
+                                                      token_scales=token_scales)
 
         inter_references_out = inter_references
         if self.two_stage:
@@ -229,8 +237,9 @@ class DeformableTransformer(nn.Module):
         return hs, init_reference_out, inter_references_out, None, None, sgdp_aux
 
     @staticmethod
-    def get_token_centers(spatial_shapes, valid_ratios, device):
+    def get_token_geometry(spatial_shapes, valid_ratios, device):
         centers = []
+        scales = []
         bs = valid_ratios.shape[0]
         for lvl, (h, w) in enumerate(spatial_shapes.tolist()):
             ref_y, ref_x = torch.meshgrid(
@@ -240,7 +249,15 @@ class DeformableTransformer(nn.Module):
             ref_y = ref_y.reshape(1, -1).repeat(bs, 1) / (valid_ratios[:, None, lvl, 1] * h)
             ref_x = ref_x.reshape(1, -1).repeat(bs, 1) / (valid_ratios[:, None, lvl, 0] * w)
             centers.append(torch.stack((ref_x, ref_y), dim=-1))
-        return torch.cat(centers, dim=1).clamp(0, 1)
+            scale_x = 1.0 / (valid_ratios[:, None, lvl, 0] * w).clamp_min(1e-6)
+            scale_y = 1.0 / (valid_ratios[:, None, lvl, 1] * h).clamp_min(1e-6)
+            scales.append(
+                torch.stack((scale_x, scale_y), dim=-1).expand(-1, h * w, -1)
+            )
+        return (
+            torch.cat(centers, dim=1).clamp(0, 1),
+            torch.cat(scales, dim=1).clamp_min(1e-6),
+        )
 
 
 class DeformableTransformerEncoderLayer(nn.Module):
@@ -318,15 +335,16 @@ class DeformableTransformerDecoderLayer(nn.Module):
     def __init__(self, d_model=256, d_ffn=1024,
                  dropout=0.1, activation="relu",
                  n_levels=4, n_heads=8, n_points=4, self_cross=True, sigmoid_attn=False, extra_track_attn=False,
-                 sgdp_topk=300, sgdp_k_min=64, sgdp_adaptive_topk=True,
+                 evidence_topk=96, evidence_score_thresh=0.35,
+                 rectification_strength=0.1,
                  enable_evidence_pruning=True, enable_channel_rectification=True):
         super().__init__()
 
         self.self_cross = self_cross
         self.num_head = n_heads
-        self.sgdp_topk = sgdp_topk
-        self.sgdp_k_min = sgdp_k_min
-        self.sgdp_adaptive_topk = sgdp_adaptive_topk
+        self.evidence_topk = evidence_topk
+        self.evidence_score_thresh = evidence_score_thresh
+        self.rectification_strength = rectification_strength
         self.enable_evidence_pruning = enable_evidence_pruning
         self.enable_channel_rectification = enable_channel_rectification
 
@@ -369,13 +387,13 @@ class DeformableTransformerDecoderLayer(nn.Module):
             nn.Linear(d_model // 4, 1),
             nn.Sigmoid()
         )
-        self.channel_gate = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
+        self.geometry_gate = nn.Sequential(
+            nn.Linear(4, d_model // 4),
             nn.ReLU(),
-            nn.Linear(d_model // 2, d_model),
-            nn.Sigmoid()
+            nn.Linear(d_model // 4, 1),
         )
-        self.beta = nn.Parameter(torch.tensor(0.0))
+        self.language_mix = nn.Linear(d_model, 2)
+        self.quality_head = nn.Linear(d_model, 1)
         # ====================
 
     @staticmethod
@@ -411,136 +429,221 @@ class DeformableTransformerDecoderLayer(nn.Module):
             tgt = torch.cat([tgt[:, :300],self.norm4(tgt[:, 300:]+self.dropout5(tgt2))], dim=1)
         return tgt
 
-    def _semantic_topk_prune(self, src, static_feat, motion_feat=None, semantic_state=None, src_padding_mask=None):
-        if motion_feat is None:
-            motion_feat = torch.zeros_like(static_feat)
-        if semantic_state is None:
-            semantic_state = static_feat
+    @staticmethod
+    def _batch_prototype(prototype, batch_index):
+        flattened = prototype.reshape(-1, prototype.shape[-1])
+        return flattened[min(batch_index, flattened.shape[0] - 1)]
 
-        semantic_response = torch.cat(
-            [src * static_feat, src * motion_feat, src * semantic_state],
-            dim=-1,
+    def _track_evidence_scores(self, src, static_feat, motion_feat, track_states,
+                               track_state_valid, track_boxes, token_centers,
+                               token_scales, src_padding_mask):
+        seq_len, batch_size, _ = src.shape
+        num_queries = track_states.shape[1]
+        scores = src.new_zeros((batch_size, num_queries, seq_len))
+
+        for batch_index in range(batch_size):
+            src_i = src[:, batch_index]
+            static_i = self._batch_prototype(static_feat, batch_index)
+            motion_i = self._batch_prototype(motion_feat, batch_index)
+            valid_tracks = torch.nonzero(
+                track_state_valid[batch_index], as_tuple=False
+            ).flatten()
+            for query_index in valid_tracks.tolist():
+                state_i = track_states[batch_index, query_index]
+                semantic_response = torch.cat(
+                    [src_i * static_i, src_i * motion_i, src_i * state_i], dim=-1
+                )
+                semantic_score = self.spatial_gate(semantic_response).squeeze(-1)
+
+                box_i = track_boxes[batch_index, query_index]
+                center_delta = token_centers[batch_index] - box_i[:2]
+                scale_delta = torch.log(
+                    token_scales[batch_index] / box_i[2:].clamp_min(1e-6)
+                )
+                geometry = torch.cat([center_delta, scale_delta], dim=-1)
+                geometry_bias = self.geometry_gate(geometry).squeeze(-1)
+                score_i = torch.sigmoid(
+                    torch.logit(semantic_score.clamp(1e-6, 1 - 1e-6))
+                    + geometry_bias
+                )
+                if src_padding_mask is not None:
+                    score_i = score_i.masked_fill(
+                        src_padding_mask[batch_index], 0.0
+                    )
+                scores[batch_index, query_index] = score_i
+        return scores
+
+    def _route_track_evidence(self, tgt, query_pos, reference_points, src,
+                              src_spatial_shapes, level_start_index,
+                              src_padding_mask, static_feat, motion_feat,
+                              track_states, track_state_valid, track_boxes,
+                              token_centers, token_scales):
+        src_batch = src.transpose(0, 1)
+        query = self.with_pos_embed(tgt, query_pos)
+        routed = self.cross_attn(
+            query, reference_points, src_batch, src_spatial_shapes,
+            level_start_index, src_padding_mask
         )
-        spatial_score = self.spatial_gate(semantic_response)
-        score = spatial_score.squeeze(-1).transpose(0, 1)
-        if src_padding_mask is not None:
-            score = score.masked_fill(src_padding_mask, float("-inf"))
 
-        valid = torch.isfinite(score)
-        keep = torch.zeros_like(score, dtype=torch.bool)
-        if not self.enable_evidence_pruning:
-            keep = valid
-        elif self.sgdp_topk <= 0:
-            keep = torch.isfinite(score)
-        else:
-            max_valid = valid.sum(dim=1).clamp(min=1)
-            k_max = min(self.sgdp_topk, score.shape[-1])
-            k_min = min(max(self.sgdp_k_min, 1), k_max)
-            if self.sgdp_adaptive_topk and k_min < k_max:
-                safe_score = score.masked_fill(~valid, 0.0).clamp_min(1e-6)
-                prob = safe_score / safe_score.sum(dim=1, keepdim=True).clamp_min(1e-6)
-                entropy = -(prob * prob.clamp_min(1e-6).log()).sum(dim=1)
-                entropy = entropy / max(math.log(score.shape[-1]), 1e-6)
-                budgets = k_min + ((k_max - k_min) * entropy).floor().long()
+        batch_size, num_queries = tgt.shape[:2]
+        seq_len = src.shape[0]
+        empty_scores = src.new_zeros((batch_size, num_queries, seq_len))
+        empty_keep = torch.zeros(
+            (batch_size, num_queries, seq_len), dtype=torch.bool, device=src.device
+        )
+        if (
+            static_feat is None
+            or motion_feat is None
+            or track_states is None
+            or track_state_valid is None
+            or track_boxes is None
+            or token_centers is None
+            or token_scales is None
+        ):
+            return routed, empty_scores, empty_keep
+
+        scores = self._track_evidence_scores(
+            src, static_feat, motion_feat, track_states, track_state_valid,
+            track_boxes, token_centers, token_scales, src_padding_mask
+        )
+        token_keep = empty_keep
+        routed = routed.clone()
+
+        for batch_index in range(batch_size):
+            if src_padding_mask is None:
+                valid_tokens = torch.ones(seq_len, dtype=torch.bool, device=src.device)
             else:
-                budgets = score.new_full((score.shape[0],), k_max, dtype=torch.long)
-            budgets = torch.minimum(budgets, max_valid)
-            for b, budget in enumerate(budgets.tolist()):
-                if budget > 0:
-                    keep[b].scatter_(0, torch.topk(score[b], budget, dim=0).indices, True)
-        keep = keep.transpose(0, 1).unsqueeze(-1).to(src.dtype)
-        pruned_src = src * keep
-        return pruned_src, spatial_score.squeeze(-1).transpose(0, 1), keep.squeeze(-1).transpose(0, 1).bool(), src.transpose(0, 1)
+                valid_tokens = ~src_padding_mask[batch_index]
+            valid_tracks = torch.nonzero(
+                track_state_valid[batch_index], as_tuple=False
+            ).flatten()
+            for query_index in valid_tracks.tolist():
+                score_i = scores[batch_index, query_index]
+                if not self.enable_evidence_pruning:
+                    keep_i = valid_tokens
+                    weights = keep_i.to(src.dtype)
+                elif self.training:
+                    keep_i = valid_tokens
+                    weights = score_i * keep_i.to(score_i.dtype)
+                else:
+                    keep_i = select_evidence_mask(
+                        score_i,
+                        valid_tokens,
+                        self.evidence_topk,
+                        self.evidence_score_thresh,
+                    )
+                    weights = score_i * keep_i.to(score_i.dtype)
+
+                token_keep[batch_index, query_index] = keep_i
+                weighted_src = src_batch[batch_index:batch_index + 1] * weights.view(1, -1, 1)
+                routed_i = self.cross_attn(
+                    query[batch_index:batch_index + 1, query_index:query_index + 1],
+                    reference_points[
+                        batch_index:batch_index + 1,
+                        query_index:query_index + 1,
+                    ],
+                    weighted_src,
+                    src_spatial_shapes,
+                    level_start_index,
+                    (~keep_i).view(1, -1),
+                )
+                routed[batch_index:batch_index + 1, query_index:query_index + 1] = routed_i
+
+        return routed, scores, token_keep
+
+    def _rectify_and_score(self, tgt, attended, static_feat, motion_feat):
+        if self.enable_channel_rectification and static_feat is not None and motion_feat is not None:
+            mixture = torch.softmax(self.language_mix(attended), dim=-1)
+            static = static_feat.transpose(0, 1)
+            motion = motion_feat.transpose(0, 1)
+            language_delta = (
+                mixture[..., 0:1] * static
+                + mixture[..., 1:2] * motion
+            )
+            tgt = tgt + self.dropout1(attended) + self.rectification_strength * language_delta
+        else:
+            tgt = tgt + self.dropout1(attended)
+        tgt = self.norm1(tgt)
+        quality = torch.sigmoid(self.quality_head(tgt)).squeeze(-1)
+        return tgt, quality
 
     def _forward_self_cross(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index,
                             src_padding_mask=None, attn_mask=None, lvl_pos_embed_flatten=None,
-                            static_feat=None, motion_feat=None, semantic_state=None):
-        
-        # === SGDP Spatial Pruning ===
-        sgdp_info = None
-        if static_feat is not None:
-             src, token_scores, token_keep, token_features = self._semantic_topk_prune(
-                 src, static_feat, motion_feat, semantic_state, src_padding_mask)
-             sgdp_info = {'token_scores': token_scores, 'token_keep': token_keep, 'token_features': token_features}
+                            static_feat=None, motion_feat=None, track_states=None,
+                            track_state_valid=None, track_boxes=None,
+                            token_centers=None, token_scales=None):
 
         # self attention
-        src = src.transpose(0, 1)
         tgt = self._forward_self_attn(tgt, query_pos, attn_mask)
-        
-        tgt2 = self.cross_attn(self.with_pos_embed(tgt, query_pos),
-                               reference_points,
-                               src, src_spatial_shapes, level_start_index, src_padding_mask)
-
-        # === SGDP Channel Pruning ===
-        if self.enable_channel_rectification and static_feat is not None and motion_feat is not None:
-            alpha = self.channel_gate(tgt2)
-            lang_refined = alpha * static_feat + (1 - alpha) * motion_feat
-            tgt = tgt + self.dropout1(tgt2) + self.beta * lang_refined
-            query_uncertainty = alpha.mean(dim=-1)
-        else:
-            tgt = tgt + self.dropout1(tgt2)
-            query_uncertainty = None
-
-        tgt = self.norm1(tgt)
+        tgt2, token_scores, token_keep = self._route_track_evidence(
+            tgt, query_pos, reference_points, src, src_spatial_shapes,
+            level_start_index, src_padding_mask, static_feat, motion_feat,
+            track_states, track_state_valid, track_boxes, token_centers,
+            token_scales
+        )
+        tgt, query_quality = self._rectify_and_score(
+            tgt, tgt2, static_feat, motion_feat
+        )
 
         # ffn
         tgt = self.forward_ffn(tgt)
 
-        if sgdp_info is None:
-            sgdp_info = {}
-        if query_uncertainty is not None:
-            sgdp_info['query_uncertainty'] = query_uncertainty
+        sgdp_info = {
+            'evidence_scores': token_scores,
+            'evidence_keep': token_keep,
+            'evidence_track_mask': track_state_valid,
+            'token_features': src.transpose(0, 1),
+            'query_quality': query_quality,
+        }
         return tgt, sgdp_info
 
     def _forward_cross_self(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index,
                             src_padding_mask=None, attn_mask=None, lvl_pos_embed_flatten=None,
-                            static_feat=None, motion_feat=None, semantic_state=None):
-        
-        # === SGDP Spatial Pruning ===
-        sgdp_info = None
-        if static_feat is not None:
-             src, token_scores, token_keep, token_features = self._semantic_topk_prune(
-                 src, static_feat, motion_feat, semantic_state, src_padding_mask)
-             sgdp_info = {'token_scores': token_scores, 'token_keep': token_keep, 'token_features': token_features}
+                            static_feat=None, motion_feat=None, track_states=None,
+                            track_state_valid=None, track_boxes=None,
+                            token_centers=None, token_scales=None):
 
         # cross attention
-        tgt2 = self.cross_attn(self.with_pos_embed(tgt, query_pos),
-                               reference_points,
-                               src, src_spatial_shapes, level_start_index, src_padding_mask)
-
-        # === SGDP Channel Pruning ===
-        if self.enable_channel_rectification and static_feat is not None and motion_feat is not None:
-            alpha = self.channel_gate(tgt2)
-            lang_refined = alpha * static_feat + (1 - alpha) * motion_feat
-            tgt = tgt + self.dropout1(tgt2) + self.beta * lang_refined
-            query_uncertainty = alpha.mean(dim=-1)
-        else:
-            tgt = tgt + self.dropout1(tgt2)
-            query_uncertainty = None
-
-        tgt = self.norm1(tgt)
+        tgt2, token_scores, token_keep = self._route_track_evidence(
+            tgt, query_pos, reference_points, src, src_spatial_shapes,
+            level_start_index, src_padding_mask, static_feat, motion_feat,
+            track_states, track_state_valid, track_boxes, token_centers,
+            token_scales
+        )
+        tgt, query_quality = self._rectify_and_score(
+            tgt, tgt2, static_feat, motion_feat
+        )
         # self attention
         tgt = self._forward_self_attn(tgt, query_pos, attn_mask)
         # ffn
         tgt = self.forward_ffn(tgt)
 
-        if sgdp_info is None:
-            sgdp_info = {}
-        if query_uncertainty is not None:
-            sgdp_info['query_uncertainty'] = query_uncertainty
+        sgdp_info = {
+            'evidence_scores': token_scores,
+            'evidence_keep': token_keep,
+            'evidence_track_mask': track_state_valid,
+            'token_features': src.transpose(0, 1),
+            'query_quality': query_quality,
+        }
         return tgt, sgdp_info
 
     def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index,
                 src_padding_mask=None, lvl_pos_embed_flatten=None,
-                static_feat=None, motion_feat=None, semantic_state=None):
+                static_feat=None, motion_feat=None, track_states=None,
+                track_state_valid=None, track_boxes=None,
+                token_centers=None, token_scales=None):
         attn_mask = None
         if self.self_cross:# True
             return self._forward_self_cross(tgt, query_pos, reference_points, src, src_spatial_shapes,
                                             level_start_index, src_padding_mask, attn_mask, lvl_pos_embed_flatten,
-                                            static_feat, motion_feat, semantic_state)
+                                            static_feat, motion_feat, track_states,
+                                            track_state_valid, track_boxes,
+                                            token_centers, token_scales)
         return self._forward_cross_self(tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index,
                                         src_padding_mask, attn_mask, lvl_pos_embed_flatten,
-                                        static_feat, motion_feat, semantic_state)
+                                        static_feat, motion_feat, track_states,
+                                        track_state_valid, track_boxes,
+                                        token_centers, token_scales)
 
 
 class DeformableTransformerDecoder(nn.Module):
@@ -592,7 +695,9 @@ class DeformableTransformerDecoder(nn.Module):
         
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,
                 query_pos=None, src_padding_mask=None, lvl_pos_embed_flatten=None, sentence_embeds=None, text_dict=None,
-                static_feat=None, motion_feat=None, semantic_state=None, token_centers=None):
+                static_feat=None, motion_feat=None, track_states=None,
+                track_state_valid=None, track_boxes=None, token_centers=None,
+                token_scales=None):
         b, n, c = tgt.shape
         # output = repeat(sentence_embeds, 'b c -> b n c', n=n) + tgt # rmot_4a
         sentence_embeds = repeat(sentence_embeds, 'b c -> b n c', n=n).transpose(1,0) # rmot_4
@@ -621,7 +726,11 @@ class DeformableTransformerDecoder(nn.Module):
             output, layer_sgdp_aux = layer(output, query_pos, reference_points_input, src_level, src_spatial_shapes, src_level_start_index,
                                            src_padding_mask, lvl_pos_embed_flatten,
                                            static_feat=static_feat, motion_feat=motion_feat,
-                                           semantic_state=semantic_state)
+                                           track_states=track_states,
+                                           track_state_valid=track_state_valid,
+                                           track_boxes=track_boxes,
+                                           token_centers=token_centers,
+                                           token_scales=token_scales)
             if layer_sgdp_aux:
                 sgdp_aux = layer_sgdp_aux
                 if token_centers is not None:
@@ -969,9 +1078,9 @@ def build_deforamble_transformer(args):
         decoder_self_cross=not args.decoder_cross_self,
         sigmoid_attn=args.sigmoid_attn,
         extra_track_attn=args.extra_track_attn,
-        sgdp_topk=args.sgdp_topk,
-        sgdp_k_min=args.sgdp_k_min,
-        sgdp_adaptive_topk=args.sgdp_adaptive_topk,
+        evidence_topk=args.evidence_topk,
+        evidence_score_thresh=args.evidence_score_thresh,
+        rectification_strength=args.rectification_strength,
         enable_evidence_pruning=not args.disable_evidence_pruning,
         enable_channel_rectification=not args.disable_channel_rectification,
     )

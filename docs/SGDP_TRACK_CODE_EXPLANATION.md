@@ -1,5 +1,11 @@
 # SGDP-Track Code Explanation
 
+> **Legacy document.** This file describes the precursor implementation on
+> `codex/sgdp-track-improvements`. The paper-aligned DriftGuard implementation
+> is documented in `README.md`; its canonical controls are
+> `--evidence_topk`, `--evidence_score_thresh`, and
+> `--state_update_thresh`.
+
 本文档说明当前分支 `codex/sgdp-track-improvements` 相对原始 UDAtrack / DKGTrack 代码做了哪些改进、改进代码在哪里、关键代码是什么，以及每一部分实现的功能。
 
 当前分支：

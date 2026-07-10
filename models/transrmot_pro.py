@@ -46,6 +46,7 @@ from .segmentation import sigmoid_focal_loss
 from .position_encoding import PositionEmbeddingSine1D
 from torch.cuda.amp import autocast as autocast
 from .spatial_temporal_reason import SpatialTemporalReasoner
+from .driftguard import cosine_association_reliability, box_motion_consistency
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # this disables a huggingface tokenizer warning (printed every epoch)
 
 class ClipMatcher(SetCriterion):
@@ -56,7 +57,9 @@ class ClipMatcher(SetCriterion):
                         racl_beta=2.0,
                         racl_temperature=0.07,
                         racl_num_negatives=50,
-                        cf_score_thresh=0.35):
+                        text_proposal_thresh=0.55,
+                        association_margin=0.05,
+                        quality_beta=2.0):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -76,7 +79,9 @@ class ClipMatcher(SetCriterion):
         self.racl_beta = racl_beta
         self.racl_temperature = racl_temperature
         self.racl_num_negatives = racl_num_negatives
-        self.cf_score_thresh = cf_score_thresh
+        self.text_proposal_thresh = text_proposal_thresh
+        self.association_margin = association_margin
+        self.quality_beta = quality_beta
         self.racl_memory = {}
 
     def initialize_for_single_clip(self, gt_instances: List[Instances], dataset_name=None):
@@ -126,8 +131,9 @@ class ClipMatcher(SetCriterion):
             'boxes': self.loss_boxes,
             'refers': self.loss_refers,
             'loss_contrastive': self.loss_contrastive,
+            'loss_evidence': self.loss_evidence,
             'loss_counterfactual': self.loss_counterfactual,
-            'loss_uncertainty': self.loss_uncertainty,
+            'loss_quality': self.loss_quality,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, gt_instances, indices, num_boxes, **kwargs)
@@ -304,14 +310,115 @@ class ClipMatcher(SetCriterion):
         inside = (px >= xyxy[:, 0]) & (px <= xyxy[:, 2]) & (py >= xyxy[:, 1]) & (py <= xyxy[:, 3])
         return inside.any(dim=1)
 
+    @staticmethod
+    def _points_in_each_box(points, boxes):
+        if boxes.numel() == 0 or points.numel() == 0:
+            return torch.zeros(
+                (boxes.shape[0], points.shape[0]), dtype=torch.bool,
+                device=points.device
+            )
+        xyxy = box_ops.box_cxcywh_to_xyxy(boxes)
+        px = points[:, 0].view(1, -1)
+        py = points[:, 1].view(1, -1)
+        return (
+            (px >= xyxy[:, 0:1])
+            & (px <= xyxy[:, 2:3])
+            & (py >= xyxy[:, 1:2])
+            & (py <= xyxy[:, 3:4])
+        )
+
+    def _hard_negative_boxes(self, outputs, batch_id, src_idx, tgt_idx, row, gt_i):
+        target_gt_idx = tgt_idx[row]
+        other_gt = torch.arange(len(gt_i), device=tgt_idx.device) != target_gt_idx
+        box_negatives = gt_i.boxes[other_gt]
+
+        matched_query = torch.zeros(
+            outputs['pred_boxes'].shape[1], dtype=torch.bool,
+            device=outputs['pred_boxes'].device
+        )
+        matched_query[src_idx] = True
+        referring_scores = outputs['pred_refers'][batch_id].sigmoid().flatten()
+        text_query = (~matched_query) & (referring_scores >= self.text_proposal_thresh)
+        text_negatives = outputs['pred_boxes'][batch_id, text_query].detach()
+
+        track_negatives = outputs['pred_boxes'].new_zeros((0, 4))
+        if 'association_scores' in outputs and src_idx.numel() > 1:
+            association = outputs['association_scores'][batch_id]
+            anchor_score = association[src_idx[row]]
+            other_rows = torch.arange(src_idx.numel(), device=src_idx.device) != row
+            other_rows &= tgt_idx != target_gt_idx
+            other_queries = src_idx[other_rows]
+            if other_queries.numel() > 0:
+                close = association[other_queries] >= anchor_score - self.association_margin
+                track_negatives = outputs['pred_boxes'][
+                    batch_id, other_queries[close]
+                ].detach()
+
+        return {
+            'box': box_negatives,
+            'text': text_negatives,
+            'track': track_negatives,
+        }
+
+    @staticmethod
+    def _focal_binary_loss(probabilities, targets, alpha=0.25, gamma=2.0):
+        probabilities = probabilities.clamp(1e-6, 1 - 1e-6)
+        bce = F.binary_cross_entropy(probabilities, targets, reduction='none')
+        p_t = probabilities * targets + (1 - probabilities) * (1 - targets)
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        return alpha_t * (1 - p_t).pow(gamma) * bce
+
+    def loss_evidence(self, outputs, gt_instances: List[Instances], indices: List[tuple], num_boxes, log=False):
+        required = ('evidence_scores', 'evidence_track_mask', 'token_centers')
+        if any(key not in outputs for key in required):
+            return {'loss_evidence': outputs['pred_logits'].new_tensor(0.0)}
+
+        total_loss = outputs['pred_logits'].new_tensor(0.0)
+        normalizer = outputs['pred_logits'].new_tensor(0.0)
+        for batch_id, (src_idx, tgt_idx) in enumerate(indices):
+            matched = tgt_idx != -1
+            src_idx = src_idx[matched]
+            tgt_idx = tgt_idx[matched]
+            if src_idx.numel() == 0:
+                continue
+
+            centers = outputs['token_centers'][batch_id]
+            gt_i = gt_instances[batch_id]
+            for row, query_index in enumerate(src_idx):
+                if not outputs['evidence_track_mask'][batch_id, query_index]:
+                    continue
+                target_index = int(tgt_idx[row].item())
+                target_box = gt_i.boxes[target_index:target_index + 1]
+                positive = self._points_in_boxes(centers, target_box)
+                hard_regions = self._hard_negative_boxes(
+                    outputs, batch_id, src_idx, tgt_idx, row, gt_i
+                )
+                hard_boxes = [boxes for boxes in hard_regions.values() if boxes.numel() > 0]
+                if hard_boxes:
+                    negative = self._points_in_boxes(centers, torch.cat(hard_boxes, dim=0))
+                    negative &= ~positive
+                else:
+                    negative = torch.zeros_like(positive)
+
+                supervised = positive | negative
+                if not supervised.any():
+                    continue
+                labels = positive[supervised].to(outputs['evidence_scores'].dtype)
+                probabilities = outputs['evidence_scores'][batch_id, query_index, supervised]
+                total_loss = total_loss + self._focal_binary_loss(
+                    probabilities, labels
+                ).sum()
+                normalizer = normalizer + supervised.sum()
+
+        return {'loss_evidence': total_loss / normalizer.clamp_min(1.0)}
+
     def loss_counterfactual(self, outputs, gt_instances: List[Instances], indices: List[tuple], num_boxes, log=False):
-        required = ('sgdp_token_scores', 'sgdp_token_features', 'sgdp_token_centers', 'query_feats')
+        required = ('token_features', 'token_centers', 'query_feats', 'evidence_track_mask')
         if any(key not in outputs for key in required):
             return {'loss_counterfactual': outputs['pred_logits'].new_tensor(0.0)}
 
-        token_scores = outputs['sgdp_token_scores']
-        token_features = outputs['sgdp_token_features']
-        token_centers = outputs['sgdp_token_centers']
+        token_features = outputs['token_features']
+        token_centers = outputs['token_centers']
         query_feats = outputs['query_feats']
         total_loss = query_feats.new_tensor(0.0)
         normalizer = query_feats.new_tensor(0.0)
@@ -324,29 +431,7 @@ class ClipMatcher(SetCriterion):
                 continue
 
             gt_i = gt_instances[batch_id]
-            gt_boxes = gt_i.boxes
-            if hasattr(gt_i, 'is_ref'):
-                ref_mask = gt_i.is_ref.reshape(-1).bool()
-                if ref_mask.numel() == len(gt_i) and ref_mask.any():
-                    referred_boxes = gt_boxes[ref_mask]
-                else:
-                    referred_boxes = gt_boxes
-            else:
-                referred_boxes = gt_boxes
-
             centers = token_centers[batch_id]
-            scores = token_scores[batch_id]
-            high_response = scores > self.cf_score_thresh
-            inside_referred = self._points_in_boxes(centers, referred_boxes)
-            distractor_mask = high_response & (~inside_referred)
-
-            distractors = token_features[batch_id, distractor_mask]
-            if distractors.numel() == 0:
-                continue
-            distractors = F.normalize(distractors, p=2, dim=-1)
-            if self.racl_num_negatives > 0 and distractors.shape[0] > self.racl_num_negatives:
-                distractors = distractors[torch.topk(scores[distractor_mask], self.racl_num_negatives, dim=0).indices]
-
             pred_boxes = outputs['pred_boxes'][batch_id, src_idx].detach()
             target_boxes = gt_i.boxes[tgt_idx]
             pred_xyxy = box_ops.box_cxcywh_to_xyxy(pred_boxes)
@@ -354,19 +439,42 @@ class ClipMatcher(SetCriterion):
             reliability = torch.diag(box_ops.box_iou(pred_xyxy, target_xyxy)[0]).clamp(0, 1).pow(self.racl_beta).detach()
 
             for row, tgt in enumerate(tgt_idx):
-                target_box = gt_i.boxes[tgt:tgt + 1]
-                positive_mask = high_response & self._points_in_boxes(centers, target_box)
+                query_index = src_idx[row]
+                if not outputs['evidence_track_mask'][batch_id, query_index]:
+                    continue
+                query_index_int = int(query_index.item())
+                target_index = int(tgt.item())
+                target_box = gt_i.boxes[target_index:target_index + 1]
+                positive_mask = self._points_in_boxes(centers, target_box)
                 positives = token_features[batch_id, positive_mask]
-                if positives.numel() == 0:
-                    positive_mask = self._points_in_boxes(centers, target_box)
-                    positives = token_features[batch_id, positive_mask]
                 if positives.numel() == 0:
                     continue
 
                 positive = F.normalize(positives.mean(dim=0, keepdim=True), p=2, dim=-1)
-                anchor = F.normalize(query_feats[batch_id, src_idx[row:row + 1]], p=2, dim=-1)
+                hard_regions = self._hard_negative_boxes(
+                    outputs, batch_id, src_idx, tgt_idx, row, gt_i
+                )
+                negative_prototypes = []
+                for boxes in hard_regions.values():
+                    region_masks = self._points_in_each_box(centers, boxes)
+                    for region_mask in region_masks:
+                        region_tokens = token_features[batch_id, region_mask]
+                        if region_tokens.numel() > 0:
+                            negative_prototypes.append(
+                                F.normalize(region_tokens.mean(dim=0, keepdim=True), p=2, dim=-1)
+                            )
+                if not negative_prototypes:
+                    continue
+                negatives = torch.cat(negative_prototypes, dim=0)
+                anchor = F.normalize(
+                    query_feats[
+                        batch_id, query_index_int:query_index_int + 1
+                    ],
+                    p=2,
+                    dim=-1,
+                )
                 pos_logits = anchor @ positive.t()
-                neg_logits = anchor @ distractors.t()
+                neg_logits = anchor @ negatives.t()
                 logits = torch.cat([pos_logits, neg_logits], dim=1) / self.racl_temperature
                 labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
                 weight = reliability[row].clamp_min(1e-6)
@@ -377,16 +485,13 @@ class ClipMatcher(SetCriterion):
             return {'loss_counterfactual': total_loss}
         return {'loss_counterfactual': total_loss / normalizer.clamp_min(1e-6)}
 
-    def loss_uncertainty(self, outputs, gt_instances: List[Instances], indices: List[tuple], num_boxes, log=False):
-        if 'query_uncertainty' not in outputs:
-            return {'loss_uncertainty': outputs['pred_logits'].new_tensor(0.0)}
+    def loss_quality(self, outputs, gt_instances: List[Instances], indices: List[tuple], num_boxes, log=False):
+        if 'query_quality' not in outputs:
+            return {'loss_quality': outputs['pred_logits'].new_tensor(0.0)}
 
-        uncertainty = outputs['query_uncertainty']
-        if not uncertainty.requires_grad:
-            return {'loss_uncertainty': outputs['pred_logits'].new_tensor(0.0)}
-
-        total_loss = uncertainty.new_tensor(0.0)
-        normalizer = uncertainty.new_tensor(0.0)
+        quality = outputs['query_quality']
+        total_loss = quality.new_tensor(0.0)
+        normalizer = quality.new_tensor(0.0)
         for batch_id, (src_idx, tgt_idx) in enumerate(indices):
             keep = tgt_idx != -1
             src_idx = src_idx[keep]
@@ -398,14 +503,17 @@ class ClipMatcher(SetCriterion):
             target_boxes = gt_instances[batch_id].boxes[tgt_idx]
             pred_xyxy = box_ops.box_cxcywh_to_xyxy(pred_boxes)
             target_xyxy = box_ops.box_cxcywh_to_xyxy(target_boxes)
-            reliability = torch.diag(box_ops.box_iou(pred_xyxy, target_xyxy)[0]).clamp(0, 1).pow(self.racl_beta).detach()
-            target_uncertainty = 1.0 - reliability
-            total_loss = total_loss + F.l1_loss(uncertainty[batch_id, src_idx], target_uncertainty, reduction='sum')
+            target_quality = torch.diag(
+                box_ops.box_iou(pred_xyxy, target_xyxy)[0]
+            ).clamp(0, 1).pow(self.quality_beta).detach()
+            total_loss = total_loss + F.l1_loss(
+                quality[batch_id, src_idx], target_quality, reduction='sum'
+            )
             normalizer = normalizer + src_idx.numel()
 
         if normalizer.item() == 0:
-            return {'loss_uncertainty': total_loss}
-        return {'loss_uncertainty': total_loss / normalizer.clamp_min(1e-6)}
+            return {'loss_quality': total_loss}
+        return {'loss_quality': total_loss / normalizer.clamp_min(1e-6)}
 
     def match_for_single_frame(self, outputs: dict):
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
@@ -427,8 +535,9 @@ class ClipMatcher(SetCriterion):
         if 'contrastive_visual' in outputs_without_aux and 'contrastive_text' in outputs_without_aux:
             outputs_i['contrastive_visual'] = outputs_without_aux['contrastive_visual']
             outputs_i['contrastive_text'] = outputs_without_aux['contrastive_text']
-        for key in ('query_feats', 'sgdp_token_scores', 'sgdp_token_features',
-                    'sgdp_token_centers', 'sgdp_token_keep', 'query_uncertainty'):
+        for key in ('query_feats', 'evidence_scores', 'evidence_keep',
+                    'evidence_track_mask', 'token_features', 'token_centers',
+                    'query_quality', 'association_scores'):
             if key in outputs_without_aux:
                 outputs_i[key] = outputs_without_aux[key]
 
@@ -509,7 +618,7 @@ class ClipMatcher(SetCriterion):
         #     losses = ['labels', 'boxes']
         # else:
         losses = ['labels', 'boxes', 'refers', 'loss_contrastive',
-                  'loss_counterfactual', 'loss_uncertainty']
+                  'loss_evidence', 'loss_counterfactual', 'loss_quality']
         for loss in losses:
             new_track_loss = self.get_loss(loss,
                                            outputs=outputs_i,
@@ -529,7 +638,8 @@ class ClipMatcher(SetCriterion):
                 matched_indices_layer = torch.cat([new_matched_indices_layer, prev_matched_indices], dim=0)
                 # losses = ['labels', 'boxes', 'scores']
                 for loss in losses:
-                    if loss in ('loss_contrastive', 'loss_counterfactual', 'loss_uncertainty'):
+                    if loss in ('loss_contrastive', 'loss_evidence',
+                                'loss_counterfactual', 'loss_quality'):
                         continue
                     if loss == 'masks':
                         # Intermediate masks losses are too costly to compute, we ignore them.
@@ -671,7 +781,7 @@ class TransRMOT(nn.Module):
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels, criterion, track_embed,
                  aux_loss=True, with_box_refine=False, two_stage=False, memory_bank=None, use_checkpoint=False,
                  tracking=False, hist_len=4, text_encoder_path='roberta-base', text_encoder_local_files_only=False,
-                 semantic_state_momentum=0.8, semantic_state_threshold=0.05,
+                 state_update_thresh=0.45, state_init_ref_thresh=0.5,
                  use_semantic_state=True, enable_state_update=True):
         """ Initializes the model.
         Parameters:
@@ -690,11 +800,15 @@ class TransRMOT(nn.Module):
         self.track_embed = track_embed # QIM
         self.transformer = transformer # deformable detr plus
         hidden_dim = transformer.d_model 
-        self.semantic_state_momentum = semantic_state_momentum
-        self.semantic_state_threshold = semantic_state_threshold
+        self.state_update_thresh = state_update_thresh
+        self.state_init_ref_thresh = state_init_ref_thresh
         self.use_semantic_state = use_semantic_state
         self.enable_state_update = enable_state_update
-        self._semantic_state = None
+        self.state_init_query = nn.Linear(hidden_dim, hidden_dim)
+        self.state_init_static = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.state_init_motion = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.state_update_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.state_norm = nn.LayerNorm(hidden_dim)
         self.num_classes = num_classes 
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
@@ -846,14 +960,19 @@ class TransRMOT(nn.Module):
         track_instances.pred_boxes = torch.zeros((len(track_instances), 4), dtype=torch.float, device=device)
         track_instances.pred_logits = torch.zeros((len(track_instances), self.num_classes), dtype=torch.float, device=device)
         track_instances.pred_refers = torch.zeros((len(track_instances), 1), dtype=torch.float, device=device)
-        track_instances.query_uncertainty = torch.ones((len(track_instances),), dtype=torch.float, device=device)
+        track_instances.last_boxes = torch.zeros((len(track_instances), 4), dtype=torch.float, device=device)
+        track_instances.query_quality = torch.zeros((len(track_instances),), dtype=torch.float, device=device)
+        track_instances.association_reliability = torch.zeros((len(track_instances),), dtype=torch.float, device=device)
+        track_instances.state_update_gate = torch.zeros((len(track_instances),), dtype=torch.float, device=device)
+        track_instances.track_state = torch.zeros((len(track_instances), dim // 2), dtype=torch.float, device=device)
+        track_instances.track_state_valid = torch.zeros((len(track_instances),), dtype=torch.bool, device=device)
 
         """Cache for current frame information, loading temporary data for qim"""
         track_instances.cache_scores = torch.zeros((len(track_instances),), dtype=torch.float, device=device)
         track_instances.cache_pred_boxes = torch.zeros((len(track_instances), 4), dtype=torch.float, device=device)
         track_instances.cache_pred_logits = torch.zeros((len(track_instances), self.num_classes), dtype=torch.float, device=device)
         track_instances.cache_pred_refers = torch.zeros((len(track_instances), 1), dtype=torch.float, device=device)
-        track_instances.cache_query_uncertainty = torch.ones((len(track_instances),), dtype=torch.float, device=device)
+        track_instances.cache_query_quality = torch.zeros((len(track_instances),), dtype=torch.float, device=device)
 
         # embedding 
         track_instances.hist_embeds = torch.zeros(
@@ -872,50 +991,78 @@ class TransRMOT(nn.Module):
 
     def clear(self):
         self.track_base.clear()
-        self._semantic_state = None
 
-    def _get_semantic_state(self, fallback):
-        if not self.use_semantic_state or self._semantic_state is None:
-            return fallback
-        return self._semantic_state.to(fallback.device, fallback.dtype)
-
-    @torch.no_grad()
-    def _update_semantic_state(self, track_instances: Instances, training: bool):
-        if not self.use_semantic_state or not self.enable_state_update:
+    def _update_track_states(self, track_instances: Instances, previous_boxes,
+                             static_prototype, motion_prototype, training: bool):
+        if not self.use_semantic_state:
             return
         if not track_instances.has('output_embedding') or len(track_instances) == 0:
             return
 
         query_embed = track_instances.output_embedding
-        scores = track_instances.cache_scores if track_instances.has('cache_scores') else track_instances.scores
-        refers = track_instances.cache_pred_refers.sigmoid().flatten() if track_instances.has('cache_pred_refers') else torch.ones_like(scores)
-        uncertainty = track_instances.cache_query_uncertainty if track_instances.has('cache_query_uncertainty') else torch.zeros_like(scores)
+        refers = track_instances.cache_pred_refers.sigmoid().flatten()
+        quality = track_instances.cache_query_quality.clamp(0, 1)
+        previous_state = track_instances.track_state
+        state_valid = track_instances.track_state_valid
+        was_valid = state_valid.clone()
+        next_state = previous_state.clone()
+        next_valid = was_valid.clone()
 
         if training:
             active = (track_instances.obj_idxes >= 0) & (track_instances.matched_gt_idxes >= 0)
-            localization = track_instances.iou.clamp(0, 1)
+            association = active.to(query_embed.dtype)
         else:
             active = track_instances.obj_idxes >= 0
-            localization = torch.ones_like(scores)
+            appearance = cosine_association_reliability(
+                query_embed, previous_state, state_valid
+            )
+            motion = box_motion_consistency(
+                track_instances.cache_pred_boxes, previous_boxes, state_valid
+            )
+            association = appearance * motion
+            association = torch.where(
+                state_valid, association, torch.ones_like(association)
+            ) * active.to(association.dtype)
 
-        reliability = scores.clamp(0, 1) * refers.clamp(0, 1) * localization * (1.0 - uncertainty.clamp(0, 1))
-        reliability = reliability * active.float()
-        keep = reliability > self.semantic_state_threshold
-        if keep.sum() == 0:
-            return
+        gate = refers * quality * association
+        gate = gate * active.to(gate.dtype)
+        track_instances.association_reliability = association.detach()
+        track_instances.state_update_gate = gate.detach()
 
-        weights = reliability[keep].view(-1, 1)
-        state = (query_embed[keep] * weights).sum(dim=0, keepdim=True) / weights.sum().clamp_min(1e-6)
-        state = F.normalize(state, p=2, dim=-1).view(1, 1, -1)
-        if self._semantic_state is None:
-            self._semantic_state = state.detach()
-        else:
-            prev = self._semantic_state.to(state.device, state.dtype)
-            self._semantic_state = F.normalize(
-                self.semantic_state_momentum * prev + (1.0 - self.semantic_state_momentum) * state,
-                p=2,
-                dim=-1,
-            ).detach()
+        static = static_prototype.reshape(-1, static_prototype.shape[-1])[0]
+        motion = motion_prototype.reshape(-1, motion_prototype.shape[-1])[0]
+        init_allowed = (
+            torch.ones_like(active)
+            if training
+            else refers >= self.state_init_ref_thresh
+        )
+        new_tracks = active & (~was_valid) & init_allowed
+        if new_tracks.any():
+            initialized = self.state_norm(
+                self.state_init_query(query_embed[new_tracks])
+                + self.state_init_static(static).view(1, -1)
+                + self.state_init_motion(motion).view(1, -1)
+            )
+            next_state[new_tracks] = initialized
+            next_valid[new_tracks] = True
+
+        existing = (
+            active
+            & was_valid
+            & self.enable_state_update
+            & (gate >= self.state_update_thresh)
+        )
+        if existing.any():
+            candidate = self.state_norm(
+                self.state_update_proj(query_embed[existing])
+            )
+            update_gate = gate[existing].view(-1, 1)
+            next_state[existing] = (
+                (1.0 - update_gate) * previous_state[existing]
+                + update_gate * candidate
+            )
+        track_instances.track_state = next_state if training else next_state.detach()
+        track_instances.track_state_valid = next_valid
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_coord, outputs_refer):
@@ -962,7 +1109,7 @@ class TransRMOT(nn.Module):
 
         return text_features, text_pad_mask, text_sentence_features, motion_map, subject_map, static_map, motion_feat, static_feat, subject_feat  
 
-    def _forward_single_image(self, samples, track_instances: Instances, sentences, semantic_state_override=None):
+    def _forward_single_image(self, samples, track_instances: Instances, sentences):
         features, pos = self.backbone(samples) 
         src, mask = features[-1].decompose()
         assert mask is not None
@@ -990,10 +1137,14 @@ class TransRMOT(nn.Module):
         else:
             # Fallback: 全0向量，避免影响融合
             motion_prototype = torch.zeros_like(static_prototype)
-        if semantic_state_override is None:
-            semantic_state = self._get_semantic_state(static_prototype)
-        else:
-            semantic_state = semantic_state_override.to(static_prototype.device, static_prototype.dtype)
+        track_states = track_instances.track_state.unsqueeze(0)
+        track_state_valid = (
+            track_instances.track_state_valid
+            & (track_instances.obj_idxes >= 0)
+        ).unsqueeze(0)
+        if not self.use_semantic_state:
+            track_state_valid = torch.zeros_like(track_state_valid)
+        track_boxes = track_instances.last_boxes.unsqueeze(0)
         # =======================================================
 
         text_word_mask = text_word_mask.flatten(0, 1).unsqueeze(0)
@@ -1076,7 +1227,9 @@ class TransRMOT(nn.Module):
                              ref_pts=track_instances.ref_pts,
                              static_feat=static_prototype,   # <--- 新增
                              motion_feat=motion_prototype,
-                             semantic_state=semantic_state)   # <--- 新增
+                             track_states=track_states,
+                             track_state_valid=track_state_valid,
+                             track_boxes=track_boxes)
         # ===============================================
 
         outputs_classes = []
@@ -1107,7 +1260,9 @@ class TransRMOT(nn.Module):
         outputs_refer = torch.stack(outputs_refers)
         ref_pts_all = torch.cat([init_reference[None], inter_references[:, :, :, :2]], dim=0)
         last_query_feats = hs[-1]
-        visual_embeds = F.normalize(self.contrastive_proj_img(last_query_feats.detach()), p=2, dim=-1)
+        visual_embeds = F.normalize(
+            self.contrastive_proj_img(last_query_feats), p=2, dim=-1
+        )
         text_proto = sentence_embeds
         text_embeds = F.normalize(self.contrastive_proj_text(text_proto), p=2, dim=-1)
         # last_query_embeds = track_instances.query_embeds.clone()
@@ -1119,29 +1274,48 @@ class TransRMOT(nn.Module):
             'query_feats':last_query_feats,
             'contrastive_visual': visual_embeds,
             'contrastive_text': text_embeds,
+            'static_prototype': static_prototype,
+            'motion_prototype': motion_prototype,
             }
         if sgdp_aux:
-            if 'token_scores' in sgdp_aux:
-                out['sgdp_token_scores'] = sgdp_aux['token_scores']
+            if 'evidence_scores' in sgdp_aux:
+                out['evidence_scores'] = sgdp_aux['evidence_scores']
             if 'token_features' in sgdp_aux:
-                out['sgdp_token_features'] = sgdp_aux['token_features']
+                out['token_features'] = sgdp_aux['token_features']
             if 'token_centers' in sgdp_aux:
-                out['sgdp_token_centers'] = sgdp_aux['token_centers']
-            if 'token_keep' in sgdp_aux:
-                out['sgdp_token_keep'] = sgdp_aux['token_keep']
-            if 'query_uncertainty' in sgdp_aux:
-                out['query_uncertainty'] = sgdp_aux['query_uncertainty']
+                out['token_centers'] = sgdp_aux['token_centers']
+            if 'evidence_keep' in sgdp_aux:
+                out['evidence_keep'] = sgdp_aux['evidence_keep']
+            if 'evidence_track_mask' in sgdp_aux:
+                out['evidence_track_mask'] = sgdp_aux['evidence_track_mask']
+            if 'query_quality' in sgdp_aux:
+                out['query_quality'] = sgdp_aux['query_quality']
         batch_size, num_queries = outputs_class[-1].shape[:2]
-        if 'query_uncertainty' not in out:
-            out['query_uncertainty'] = outputs_class[-1].new_zeros((batch_size, num_queries))
-        if 'sgdp_token_scores' not in out:
-            out['sgdp_token_scores'] = outputs_class[-1].new_zeros((batch_size, 0))
-        if 'sgdp_token_features' not in out:
-            out['sgdp_token_features'] = last_query_feats.new_zeros((batch_size, 0, last_query_feats.shape[-1]))
-        if 'sgdp_token_centers' not in out:
-            out['sgdp_token_centers'] = outputs_coord[-1].new_zeros((batch_size, 0, 2))
-        if 'sgdp_token_keep' not in out:
-            out['sgdp_token_keep'] = torch.zeros((batch_size, 0), dtype=torch.bool, device=outputs_class.device)
+        if 'query_quality' not in out:
+            out['query_quality'] = outputs_class[-1].new_zeros((batch_size, num_queries))
+        if 'evidence_scores' not in out:
+            out['evidence_scores'] = outputs_class[-1].new_zeros((batch_size, num_queries, 0))
+        if 'token_features' not in out:
+            out['token_features'] = last_query_feats.new_zeros((batch_size, 0, last_query_feats.shape[-1]))
+        if 'token_centers' not in out:
+            out['token_centers'] = outputs_coord[-1].new_zeros((batch_size, 0, 2))
+        if 'evidence_keep' not in out:
+            out['evidence_keep'] = torch.zeros(
+                (batch_size, num_queries, 0), dtype=torch.bool,
+                device=outputs_class.device
+            )
+        if 'evidence_track_mask' not in out:
+            out['evidence_track_mask'] = torch.zeros(
+                (batch_size, num_queries), dtype=torch.bool,
+                device=outputs_class.device
+            )
+        appearance = cosine_association_reliability(
+            last_query_feats, track_states, track_state_valid
+        )
+        motion_consistency = box_motion_consistency(
+            outputs_coord[-1], track_boxes, track_state_valid
+        )
+        out['association_scores'] = appearance * motion_consistency
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, outputs_refer)
         out['text_word_mask'] = text_word_mask 
@@ -1151,6 +1325,7 @@ class TransRMOT(nn.Module):
 
     def _post_process_single_image(self, frame_res, track_instances, is_last):
         frame_res['track_instances'] = track_instances
+        previous_boxes = track_instances.last_boxes.detach().clone()
         text_result = {
             'text_word_mask':frame_res.pop('text_word_mask'),
             'text_pos':frame_res.pop('text_pos'),
@@ -1175,12 +1350,26 @@ class TransRMOT(nn.Module):
             frame_res['pred_logits'] = track_instances.pred_logits
             frame_res['pred_boxes'] = track_instances.pred_boxes
             frame_res['pred_refers'] = track_instances.pred_refers
-            self._update_semantic_state(track_instances, training=True)
+            self._update_track_states(
+                track_instances,
+                previous_boxes,
+                frame_res['static_prototype'],
+                frame_res['motion_prototype'],
+                training=True,
+            )
         else:
             track_instances = self.STReasoner(track_instances,text_result,training=False)
             track_instances = self.frame_summarization(track_instances,tracking=True)
             self.track_base.update(track_instances)
-            self._update_semantic_state(track_instances, training=False)
+            self._update_track_states(
+                track_instances,
+                previous_boxes,
+                frame_res['static_prototype'],
+                frame_res['motion_prototype'],
+                training=False,
+            )
+
+        track_instances.last_boxes = track_instances.cache_pred_boxes.detach().clone()
         
         tmp = {}
         tmp['init_track_instances'] = self._generate_empty_tracks()
@@ -1198,7 +1387,6 @@ class TransRMOT(nn.Module):
         if not isinstance(img, NestedTensor):
             img = nested_tensor_from_tensor_list(img)
         if track_instances is None:
-            self._semantic_state = None
             track_instances = self._generate_empty_tracks()
         res = self._forward_single_image(img, track_instances=track_instances, sentences=sentence)
         track_instances = self.load_detection_output_into_cache(track_instances,res)
@@ -1239,10 +1427,10 @@ class TransRMOT(nn.Module):
         track_instances.output_embedding = query_feats[0].clone() 
         track_instances.cache_pred_boxes = out['pred_boxes'][0].clone() 
         track_instances.cache_pred_refers = out['pred_refers'][0].clone()
-        if 'query_uncertainty' in out:
-            track_instances.cache_query_uncertainty = out['query_uncertainty'][0].detach().clone()
+        if 'query_quality' in out:
+            track_instances.cache_query_quality = out['query_quality'][0].clone()
         else:
-            track_instances.cache_query_uncertainty = torch.zeros_like(track_scores)
+            track_instances.cache_query_quality = torch.zeros_like(track_scores)
         return track_instances
 
 
@@ -1253,7 +1441,7 @@ class TransRMOT(nn.Module):
         track_instances.scores = track_instances.cache_scores
         track_instances.pred_refers = track_instances.cache_pred_refers 
         track_instances.pred_boxes = track_instances.cache_pred_boxes
-        track_instances.query_uncertainty = track_instances.cache_query_uncertainty
+        track_instances.query_quality = track_instances.cache_query_quality
         return track_instances
     
     def proceesing_text_decoupling(self, text):
@@ -1361,7 +1549,6 @@ class TransRMOT(nn.Module):
     # @autocast()
     def forward(self, data: dict):
         # data_dict = copy.deepcopy(data)
-        self._semantic_state = None
         if self.training:
             self.criterion.initialize_for_single_clip(data['gt_instances'], data['dataset_name'])
         frames = data['imgs']  # list of Tensor.
@@ -1379,19 +1566,11 @@ class TransRMOT(nn.Module):
             frame.requires_grad = False
             is_last = frame_index == len(frames) - 1
             if self.use_checkpoint and frame_index < len(frames) - 1:
-                if not self.use_semantic_state or self._semantic_state is None:
-                    semantic_state_for_checkpoint = None
-                else:
-                    semantic_state_for_checkpoint = self._semantic_state.detach()
-
                 def fn(frame, *args):
                     frame = nested_tensor_from_tensor_list([frame])
                     # frame.requires_grad = False
                     tmp = Instances((1, 1), **dict(zip(keys, args)))
-                    frame_res = self._forward_single_image(
-                        frame, tmp, sentences,
-                        semantic_state_override=semantic_state_for_checkpoint,
-                    )
+                    frame_res = self._forward_single_image(frame, tmp, sentences)
                     return (
                         frame_res['pred_logits'],
                         frame_res['pred_boxes'],
@@ -1401,11 +1580,15 @@ class TransRMOT(nn.Module):
                         frame_res['text_word_mask'],
                         frame_res['text_pos'],
                         frame_res['text_word_features'],
-                        frame_res['query_uncertainty'],
-                        frame_res['sgdp_token_scores'],
-                        frame_res['sgdp_token_features'],
-                        frame_res['sgdp_token_centers'],
-                        frame_res['sgdp_token_keep'],
+                        frame_res['static_prototype'],
+                        frame_res['motion_prototype'],
+                        frame_res['query_quality'],
+                        frame_res['evidence_scores'],
+                        frame_res['token_features'],
+                        frame_res['token_centers'],
+                        frame_res['evidence_keep'],
+                        frame_res['evidence_track_mask'],
+                        frame_res['association_scores'],
                         *[aux['pred_logits'] for aux in frame_res['aux_outputs']],
                         *[aux['pred_boxes'] for aux in frame_res['aux_outputs']],
                         *[aux['pred_refers'] for aux in frame_res['aux_outputs']],
@@ -1414,7 +1597,7 @@ class TransRMOT(nn.Module):
                 args = [frame] + [track_instances.get(k) for k in keys]
                 params = tuple((p for p in self.parameters() if p.requires_grad))
                 tmp = checkpoint.CheckpointFunction.apply(fn, len(args), *args, *params)
-                aux_start = 13
+                aux_start = 17
                 num_aux = self.transformer.decoder.num_layers - 1
                 frame_res = {
                     'pred_logits': tmp[0],
@@ -1425,11 +1608,15 @@ class TransRMOT(nn.Module):
                     'text_word_mask': tmp[5] ,
                     'text_pos': tmp[6],
                     'text_word_features': tmp[7],
-                    'query_uncertainty': tmp[8],
-                    'sgdp_token_scores': tmp[9],
-                    'sgdp_token_features': tmp[10],
-                    'sgdp_token_centers': tmp[11],
-                    'sgdp_token_keep': tmp[12],
+                    'static_prototype': tmp[8],
+                    'motion_prototype': tmp[9],
+                    'query_quality': tmp[10],
+                    'evidence_scores': tmp[11],
+                    'token_features': tmp[12],
+                    'token_centers': tmp[13],
+                    'evidence_keep': tmp[14],
+                    'evidence_track_mask': tmp[15],
+                    'association_scores': tmp[16],
                     'aux_outputs': [{
                         'pred_logits': tmp[aux_start + i],
                         'pred_boxes': tmp[aux_start + num_aux + i],
@@ -1484,8 +1671,9 @@ def build(args):
                             'frame_{}_loss_giou'.format(i): args.giou_loss_coef,
                             'frame_{}_loss_refer'.format(i): args.refer_loss_coef,
                             'frame_{}_loss_contrastive'.format(i): args.racl_loss_coef,
+                            'frame_{}_loss_evidence'.format(i): args.evidence_loss_coef,
                             'frame_{}_loss_counterfactual'.format(i): args.cf_loss_coef,
-                            'frame_{}_loss_uncertainty'.format(i): args.unc_loss_coef,
+                            'frame_{}_loss_quality'.format(i): args.quality_loss_coef,
                             "frame_{}_temporal_loss_ce".format(i): args.cls_loss_coef,
                             'frame_{}_temporal_loss_bbox'.format(i): args.bbox_loss_coef,
                             'frame_{}_temporal_loss_giou'.format(i): args.giou_loss_coef,
@@ -1508,7 +1696,7 @@ def build(args):
     else:
         memory_bank = None
     losses = ['labels', 'boxes', 'refers', 'loss_contrastive',
-              'loss_counterfactual', 'loss_uncertainty']
+              'loss_evidence', 'loss_counterfactual', 'loss_quality']
     criterion = ClipMatcher(
         num_classes,
         matcher=img_matcher,
@@ -1517,7 +1705,9 @@ def build(args):
         racl_beta=args.racl_beta,
         racl_temperature=args.racl_temperature,
         racl_num_negatives=args.racl_num_negatives,
-        cf_score_thresh=args.cf_score_thresh,
+        text_proposal_thresh=args.text_proposal_thresh,
+        association_margin=args.association_margin,
+        quality_beta=args.quality_beta,
     )
     criterion.to(device)
     postprocessors = {}
@@ -1538,8 +1728,8 @@ def build(args):
         hist_len=args.hist_len,
         text_encoder_path=args.text_encoder_path,
         text_encoder_local_files_only=args.text_encoder_local_files_only,
-        semantic_state_momentum=args.semantic_state_momentum,
-        semantic_state_threshold=args.semantic_state_threshold,
+        state_update_thresh=args.state_update_thresh,
+        state_init_ref_thresh=args.state_init_ref_thresh,
         use_semantic_state=not args.disable_semantic_state,
         enable_state_update=not args.disable_state_update,
     )

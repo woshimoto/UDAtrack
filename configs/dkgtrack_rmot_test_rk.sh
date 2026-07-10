@@ -3,9 +3,9 @@ set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 DATA_ROOT="${DATA_ROOT:-/path/to/Refer-KITTI}"
-CHECKPOINT="${CHECKPOINT:-${PROJECT_ROOT}/exps/sgdp_track_refer_kitti/checkpoint.pth}"
+CHECKPOINT="${CHECKPOINT:-${PROJECT_ROOT}/exps/driftguard_refer_kitti/checkpoint0059.pth}"
 TEXT_ENCODER_PATH="${TEXT_ENCODER_PATH:-roberta-base}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/exps/sgdp_track_refer_kitti/eval}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/exps/driftguard_refer_kitti/eval}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 export CUDA_VISIBLE_DEVICES
@@ -30,7 +30,9 @@ python3 "${PROJECT_ROOT}/inference.py" \
   --rmot_path "${DATA_ROOT}" \
   --resume "${CHECKPOINT}" \
   --output_dir "${OUTPUT_DIR}" \
-  --sgdp_topk 300 \
-  --sgdp_k_min 64 \
+  --evidence_topk 96 \
+  --evidence_score_thresh 0.35 \
+  --state_update_thresh 0.45 \
+  --inference_video_ids 0011 0013 \
   --text_encoder_path "${TEXT_ENCODER_PATH}" \
   "$@"
