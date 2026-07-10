@@ -15,7 +15,16 @@ import numpy as np
 def load_model(model, model_path, optimizer=None, resume=False,
                lr=None, lr_step=None):
     start_epoch = 0
-    checkpoint = torch.load(model_path, map_location=lambda storage, loc: storage)
+    try:
+        checkpoint = torch.load(
+            model_path,
+            map_location=lambda storage, loc: storage,
+            weights_only=False,
+        )
+    except TypeError:
+        checkpoint = torch.load(
+            model_path, map_location=lambda storage, loc: storage
+        )
     print(f'loaded {model_path}')
     state_dict = checkpoint['model']
     model_state_dict = model.state_dict()
@@ -68,6 +77,5 @@ def load_model(model, model_path, optimizer=None, resume=False,
         return model, optimizer, start_epoch
     else:
         return model
-
 
 

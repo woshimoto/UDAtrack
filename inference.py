@@ -41,12 +41,12 @@ from main import get_args_parser
 from torch.nn.functional import interpolate
 from typing import List
 from util.evaluation import Evaluator
-from thop import profile
 import motmetrics as mm
 import shutil
 import json
 import matplotlib.pyplot as plt
 import copy
+import re
 
 from models.structures import Instances
 from torch.utils.data import Dataset, DataLoader
@@ -348,6 +348,9 @@ class Detector(object):
         self.save_path = os.path.join(self.args.output_dir,
                                       'results_epoch{}/{}/{}'.format(checkpoint_id, seq_num[0], seq_num[1].split('.')[0]))
         os.makedirs(self.save_path, exist_ok=True)
+        prediction_file = os.path.join(self.save_path, 'predict.txt')
+        if os.path.exists(prediction_file):
+            os.remove(prediction_file)
 
         self.predict_path = os.path.join(self.args.output_dir, self.args.exp_name)
         os.makedirs(self.predict_path, exist_ok=True)
@@ -482,8 +485,9 @@ def sub_processor(pid,seq_nums,args):
     # load model and weights
     torch.cuda.set_device(pid)
     detr, _, _ = build_model(args)
-    checkpoint = torch.load(args.resume, map_location='cpu')
-    checkpoint_id = int(args.resume.split('/')[-1].split('.')[0].split('t')[-1])
+    checkpoint_stem = Path(args.resume).stem
+    checkpoint_numbers = re.findall(r'\d+', checkpoint_stem)
+    checkpoint_id = checkpoint_numbers[-1] if checkpoint_numbers else checkpoint_stem
     detr = load_model(detr, args.resume)
     detr.eval()
     detr = detr.cuda()
@@ -503,10 +507,13 @@ if __name__ == '__main__':
         Path(args0.output_dir).mkdir(parents=True, exist_ok=True)
 
     expressions_root = os.path.join(args0.rmot_path, 'expression')
-    if "refer-kitti-v2" in args0.rmot_path:
-        video_ids = ['0005', '0011', '0013','0019']
+    if args0.inference_video_ids:
+        video_ids = args0.inference_video_ids
     else:
-        video_ids = ['0011', '0013']
+        video_ids = sorted(
+            entry.name for entry in Path(expressions_root).iterdir()
+            if entry.is_dir()
+        )
 
     seq_nums = [] 
     for video_id in video_ids:  

@@ -139,12 +139,14 @@ def get_args_parser():
                         help='InfoNCE temperature used by RACL')
     parser.add_argument('--racl_num_negatives', default=50, type=int,
                         help='number of hard negative query embeddings sampled by RACL')
+    parser.add_argument('--evidence_loss_coef', default=1.0, type=float,
+                        help='loss weight for track-conditioned evidence supervision')
     parser.add_argument('--cf_loss_coef', default=1.0, type=float,
-                        help='loss weight for counterfactual distractor purification')
-    parser.add_argument('--unc_loss_coef', default=0.5, type=float,
-                        help='loss weight for channel uncertainty calibration')
-    parser.add_argument('--cf_score_thresh', default=0.35, type=float,
-                        help='semantic score threshold used to mine counterfactual distractor tokens')
+                        help='loss weight for counterfactual distractor separation')
+    parser.add_argument('--quality_loss_coef', default=1.0, type=float,
+                        help='loss weight for query-quality calibration')
+    parser.add_argument('--unc_loss_coef', dest='quality_loss_coef', type=float,
+                        default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     parser.add_argument('--focal_alpha', default=0.25, type=float)
 
     # dataset parameters
@@ -172,6 +174,8 @@ def get_args_parser():
 
     # end-to-end rmot settings.
     parser.add_argument('--rmot_path', default='', type=str)
+    parser.add_argument('--inference_video_ids', nargs='+', default=None,
+                        help='explicit Refer-KITTI video ids to evaluate')
     parser.add_argument('--input_video', default='figs/demo.mp4', type=str)
     parser.add_argument('--data_txt_path_train',
                         default='', type=str,
@@ -210,20 +214,34 @@ def get_args_parser():
                         help='HuggingFace model id or local directory for RoBERTa text encoder')
     parser.add_argument('--text_encoder_local_files_only', action='store_true',
                         help='load text encoder only from local files')
-    parser.add_argument('--sgdp_topk', default=300, type=int,
-                        help='number of semantic-relevant visual tokens retained by SGDP spatial pruning')
-    parser.add_argument('--sgdp_k_min', default=64, type=int,
-                        help='minimum token budget for adaptive SGDP pruning')
-    parser.add_argument('--sgdp_adaptive_topk', action='store_true', default=True,
-                        help='adapt SGDP token budget from semantic-score entropy')
-    parser.add_argument('--sgdp_disable_adaptive_topk', dest='sgdp_adaptive_topk', action='store_false',
-                        help='use fixed --sgdp_topk instead of entropy-adaptive SGDP budget')
-    parser.add_argument('--semantic_state_momentum', default=0.8, type=float,
-                        help='EMA momentum for reliability-conditioned semantic state')
-    parser.add_argument('--semantic_state_threshold', default=0.05, type=float,
-                        help='minimum reliability required to update the semantic state')
+    parser.add_argument('--evidence_topk', default=96, type=int,
+                        help='maximum number of visual tokens admitted per active track at inference')
+    parser.add_argument('--evidence_score_thresh', default=0.35, type=float,
+                        help='minimum evidence score theta_ev used for inference admission')
+    parser.add_argument('--text_proposal_thresh', default=0.55, type=float,
+                        help='referring-score threshold eta_txt for hard text proposals')
+    parser.add_argument('--association_margin', default=0.05, type=float,
+                        help='association-score margin m_a for hard track negatives')
+    parser.add_argument('--quality_beta', default=2.0, type=float,
+                        help='IoU exponent used to supervise query quality')
+    parser.add_argument('--state_update_thresh', default=0.45, type=float,
+                        help='quality-gate threshold delta_g for per-track state writes')
+    parser.add_argument('--state_init_ref_thresh', default=0.5, type=float,
+                        help='minimum referring confidence for initializing a new track state')
+    parser.add_argument('--rectification_strength', default=0.1, type=float,
+                        help='language rectification strength lambda')
+    parser.add_argument('--sgdp_topk', dest='evidence_topk', type=int,
+                        default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument('--semantic_state_threshold', dest='state_update_thresh', type=float,
+                        default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument('--sgdp_k_min', type=int, default=argparse.SUPPRESS,
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--sgdp_adaptive_topk', action='store_true', default=argparse.SUPPRESS,
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--sgdp_disable_adaptive_topk', action='store_true',
+                        default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     parser.add_argument('--disable_semantic_state', action='store_true',
-                        help='ablation: replace temporal semantic state with the static language prototype')
+                        help='ablation: disable the per-track semantic state bank')
     parser.add_argument('--disable_state_update', action='store_true',
                         help='ablation: keep the semantic state frozen during a clip')
     parser.add_argument('--disable_channel_rectification', action='store_true',

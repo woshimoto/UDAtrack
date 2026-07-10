@@ -1,19 +1,26 @@
-# SGDP-Track: Unified Feature Purification for Referring Multi-Object Tracking
+# DriftGuard: State-Safe Referring Multi-Object Tracking
 
-Official implementation for **"Where to Look and What to Trust: Unified Feature Purification for Referring Multi-Object Tracking"**.
+Implementation of **DriftGuard**, including the paper-aligned training setup and
+the one-at-a-time sensitivity protocol used in the BMVC rebuttal.
 
-SGDP-Track is an end-to-end referring multi-object tracking framework. Given a video and a natural-language query, it detects and tracks all objects matching the expression. The method follows a **Purify-then-Rectify** design:
+DriftGuard is an end-to-end referring multi-object tracker that protects each
+propagated identity in both the read and write steps:
 
-- **Reliability-conditioned semantic state** summarizes reliable track queries and conditions later token selection on language, identity, and localization trust.
-- **State-guided dual purification** adaptively keeps semantic visual tokens, mines high-response non-target tokens as counterfactual distractors, and rectifies unreliable visual channels with an uncertainty gate.
-- **Reliability-aware association learning** decouples the identity embedding branch from box regression, reuses reliable track memory, and down-weights noisy contrastive supervision using localization quality.
-- **Static/motion language prototypes** are extracted from the referring sentence to separately model appearance cues and motion cues.
+- **Per-track state bank:** every active identity owns a separate semantic state.
+- **Track-conditioned evidence admission:** training softly weights all visual
+  tokens; inference applies an evidence threshold and a hard per-track budget.
+- **Counterfactual supervision:** target evidence is contrasted with box, text
+  proposal, and competing-track negatives.
+- **Quality-gated writes:** referring confidence, calibrated box quality, and
+  association reliability jointly decide whether a state is updated or frozen.
 
-![SGDP-Track framework](assets/framework.png)
+![DriftGuard framework](assets/framework.png)
 
 ## News
 
-- Main training path now enables SGDP prototypes, Top-K spatial pruning, channel rectification, and RACL through `models/transrmot_pro.py`.
+- The training and inference paths now use the same per-track DriftGuard state.
+- `K`, `theta_ev`, and `delta_g` are independent, real inference controls.
+- The repository includes an RMOT evaluator and the seven-run sensitivity driver.
 - `datasets/` code has been restored so the repository can be imported and trained without relying on ignored local files.
 - Training and inference scripts are portable and configurable through environment variables.
 
@@ -23,12 +30,13 @@ SGDP-Track is an end-to-end referring multi-object tracking framework. Given a v
 .
 ├── main.py                         # distributed training entry
 ├── inference.py                    # online tracking inference
-├── eval.py                         # TrackEval wrapper
+├── tools/evaluate_rmot.py          # HOTA/AssA/IDSW evaluator
+├── tools/run_sensitivity.py        # seven one-at-a-time sensitivity runs
 ├── configs/                        # runnable train/test shell scripts
 ├── datasets/                       # RMOT/Refer-KITTI dataset loaders
 ├── models/
-│   ├── transrmot_pro.py            # SGDP-Track model and RACL criterion
-│   ├── deformable_transformer_plus.py # SGDP decoder implementation
+│   ├── transrmot_pro.py            # DriftGuard model and training criterion
+│   ├── deformable_transformer_plus.py # evidence router and decoder
 │   ├── spatial_temporal_reason.py  # temporal reasoning module
 │   └── ops/                        # MultiScaleDeformableAttention CUDA op
 ├── util/                           # box, checkpoint, plotting, misc utilities
@@ -40,8 +48,8 @@ SGDP-Track is an end-to-end referring multi-object tracking framework. Given a v
 We recommend Python 3.8, CUDA 11.1, and PyTorch 1.9 for compatibility with the Deformable DETR CUDA operator.
 
 ```bash
-conda create -n sgdp-track python=3.8 -y
-conda activate sgdp-track
+conda create -n driftguard python=3.8 -y
+conda activate driftguard
 
 pip install torch==1.9.0+cu111 torchvision==0.10.0+cu111 torchaudio==0.9.0 \
   -f https://download.pytorch.org/whl/torch_stable.html
@@ -76,7 +84,7 @@ Refer-KITTI:
 DATA_ROOT=/path/to/Refer-KITTI \
 PRETRAIN=/path/to/r50_deformable_detr_plus_iterative_bbox_refinement-checkpoint.pth \
 TEXT_ENCODER_PATH=/path/to/roberta_base \
-NPROC=4 \
+NPROC=8 \
 bash configs/dkgtrack_rmot_train_rk.sh
 ```
 
@@ -90,17 +98,19 @@ TEXT_ENCODER_PATH=/path/to/roberta_base \
 bash configs/dkgtrack_rmot_train.sh
 ```
 
-Important method knobs:
+Both training scripts use 60 epochs, batch size 1 per GPU, and default to eight
+GPUs. Important method controls are:
 
-- `--sgdp_topk 300`: maximum semantic visual token budget for SGDP spatial pruning.
-- `--sgdp_k_min 64`: minimum token budget when adaptive Top-K is enabled.
-- `--semantic_state_momentum 0.8`: EMA momentum for the reliability-conditioned semantic state.
+- `--evidence_topk 96`: maximum admitted tokens per active track (`K`).
+- `--evidence_score_thresh 0.35`: inference admission threshold (`theta_ev`).
+- `--state_update_thresh 0.45`: state-write threshold (`delta_g`).
+- `--text_proposal_thresh 0.55`: hard text-proposal threshold (`eta_txt`).
+- `--association_margin 0.05`: hard competing-track margin (`m_a`).
+- `--quality_beta 2`: IoU exponent used by the quality target.
+- `--rectification_strength 0.1`: static/motion language correction strength.
 - `--racl_loss_coef 1`: enables RACL in the total loss.
-- `--racl_beta 2`: uses quadratic IoU reliability weighting, matching the paper setting.
-- `--racl_temperature 0.07`: InfoNCE temperature.
-- `--racl_num_negatives 50`: number of hard negative query embeddings.
-- `--cf_loss_coef 1`: enables counterfactual distractor purification loss.
-- `--unc_loss_coef 0.5`: calibrates channel uncertainty against localization reliability.
+- `--evidence_loss_coef 1`, `--cf_loss_coef 1`, and
+  `--quality_loss_coef 1`: the three state-safety objectives.
 
 ## Inference
 
@@ -111,29 +121,57 @@ TEXT_ENCODER_PATH=/path/to/roberta_base \
 bash configs/dkgtrack_rmot_test_rk.sh
 ```
 
-Outputs are written to `OUTPUT_DIR` and can be evaluated with TrackEval.
+Outputs are written to `OUTPUT_DIR`.
 
 ## Evaluation
 
 The paper reports HOTA as the primary metric, together with DetA, AssA, DetRe, DetPr, AssRe, AssPr, and LocA.
 
 ```bash
-python eval.py --gt_dir /path/to/gt --tracker_dir /path/to/predictions
+python tools/evaluate_rmot.py \
+  --results-root /path/to/eval/results_epoch0059 \
+  --output /path/to/eval/metrics.json
 ```
 
-Reported results from the paper:
+The evaluator directly reuses the vendored HOTA and CLEAR metric
+implementations. It reports HOTA, DetA, AssA, the remaining HOTA submetrics,
+and IDSW.
 
-| Dataset | HOTA | DetA | AssA | LocA |
-| --- | ---: | ---: | ---: | ---: |
-| Refer-KITTI | 53.1 | 40.7 | 69.2 | 90.0 |
-| Refer-KITTI v2 | 36.1 | 22.4 | 58.0 | 87.6 |
+## Sensitivity Experiment
+
+The following command runs exactly seven unique settings: the default, two
+alternative values of `K`, two of `theta_ev`, and two of `delta_g`. Every run
+uses the same checkpoint and all non-varied settings remain fixed.
+
+```bash
+python tools/run_sensitivity.py \
+  --data-root /path/to/refer-kitti-v2 \
+  --checkpoint /path/to/checkpoint0059.pth \
+  --text-encoder-path /path/to/roberta-base \
+  --gpus 0 1 2 3 4 5 6 \
+  --jobs 7
+```
+
+The output directory contains `sensitivity.csv`, `sensitivity.json`, and
+`sensitivity_rows.tex`. Verify that the default run reproduces the main-paper
+checkpoint before using the remaining rows in a rebuttal.
+
+Run the lightweight routing and metric checks with:
+
+```bash
+python -m unittest tests.test_driftguard -v
+```
 
 ## Implementation Notes
 
-- Reliability-conditioned semantic state is maintained in `TransRMOT._update_semantic_state` and passed into the transformer for the next frame.
-- Adaptive state-guided pruning is implemented in `DeformableTransformerDecoderLayer._semantic_topk_prune`.
-- Counterfactual distractor purification and uncertainty calibration are implemented in `ClipMatcher.loss_counterfactual` and `ClipMatcher.loss_uncertainty`.
-- RACL is implemented in `ClipMatcher.loss_contrastive`; query embeddings are detached before projection, weighted by IoU reliability, and compared against reliable track memory.
+- The per-track state bank is stored on `Instances` and updated by
+  `TransRMOT._update_track_states`.
+- Track-conditioned routing is implemented in
+  `DeformableTransformerDecoderLayer._route_track_evidence`.
+- Evidence, counterfactual, and quality supervision are implemented by
+  `ClipMatcher.loss_evidence`, `loss_counterfactual`, and `loss_quality`.
+- RACL is implemented in `ClipMatcher.loss_contrastive`; query embeddings are
+  weighted by IoU reliability and compared against reliable track memory.
 - The text encoder path is configurable through `--text_encoder_path` or the `TEXT_ENCODER_PATH` environment variable.
 
 ## Acknowledgements
